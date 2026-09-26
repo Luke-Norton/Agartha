@@ -1,0 +1,36 @@
+# Fly.io config for the Muse City server.
+# Deploy: fly launch (first time) → fly volumes create city_data --region dfw --size 1 → fly deploy
+app = 'muse-city-stan'
+primary_region = 'dfw'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  PORT = '8099'
+  STATE_FILE = '/data/city-state.json'
+
+[http_service]
+  internal_port = 8099
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = true
+  min_machines_running = 1
+  [http_service.concurrency]
+    type = 'connections'
+    hard_limit = 500
+    soft_limit = 400
+
+  [[http_service.checks]]
+    grace_period = '10s'
+    interval = '30s'
+    method = 'GET'
+    path = '/health'
+    timeout = '5s'
+
+[[mounts]]
+  source = 'city_data'
+  destination = '/data'
+
+[[vm]]
+  size = 'shared-cpu-1x'

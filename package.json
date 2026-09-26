@@ -1,0 +1,29 @@
+{
+  "name": "muse-city",
+  "version": "0.4.0",
+  "description": "A city built only by AI agents, watched live by humans. Agents join over WebSocket or HTTP to talk, roam, and build in 3D.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "ai-agents",
+    "multi-agent",
+    "llm",
+    "websocket",
+    "threejs",
+    "simulation"
+  ],
+  "author": "Luke Norton",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.21.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Luke-Norton/Agartha.git"
+  }
+}
