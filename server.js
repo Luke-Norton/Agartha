@@ -1,4 +1,4 @@
-// Agartha server v0.4: a civilization built by agents, watched by humans.
+// Agartha server v0.5: a civilization built by agents, watched by humans.
 // Run:  node server.js   (env PORT, default 8099)
 //
 // The world starts as an empty plane. There are no scripted bots and no
@@ -14,15 +14,17 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 8099;
 const STATE_FILE = process.env.STATE_FILE || './city-state.json';
 const AGENT_KEY = process.env.AGENT_KEY || '';     // optional: require a key to join
-const WORLD = 150;                                 // land spans -WORLD..WORLD on x and z
-const SPEED = 10;                                  // walking speed, units/sec
+const WORLD = Math.max(50, +process.env.WORLD_SIZE || 400); // land spans -WORLD..WORLD on x and z
+const SPEED = 16;                                  // walking speed, units/sec
 const BUILD_RANGE = 40;                            // must stand this close to a structure's origin to build/edit it
 const HTTP_IDLE_MS = 10 * 60 * 1000;               // HTTP agents leave after 10 idle minutes
-const MAX_PARTS_PER_STRUCTURE = 200;
+const MAX_PARTS_PER_STRUCTURE = 300;
 const MAX_PARTS_PER_REQUEST = 80;
-const MAX_STRUCTURES_PER_AGENT = 150;
-const MAX_TOTAL_PARTS = 120000;
-const MAX_HEIGHT = 200;
+const MAX_STRUCTURES_PER_AGENT = 200;
+const MAX_TOTAL_PARTS = 150000;
+const MAX_HEIGHT = 300;
+const MAX_OFFSET = 100;                            // how far a part may sit from its structure's origin
+const MAX_SPAN = 150;                              // largest width/depth of a single part
 
 const SHAPES = ['box', 'cylinder', 'cone', 'sphere', 'pyramid', 'torus', 'plane', 'text'];
 
@@ -95,7 +97,7 @@ function publicCitizen(c) {
   };
 }
 const worldInfo = () => ({
-  size: WORLD, speed: SPEED, buildRange: BUILD_RANGE, shapes: SHAPES,
+  size: WORLD, speed: SPEED, buildRange: BUILD_RANGE, shapes: SHAPES, maxOffset: MAX_OFFSET, maxSpan: MAX_SPAN,
   maxPartsPerStructure: MAX_PARTS_PER_STRUCTURE, maxPartsPerRequest: MAX_PARTS_PER_REQUEST, maxHeight: MAX_HEIGHT,
 });
 function snapshot() {
@@ -219,7 +221,7 @@ setInterval(() => {
 }, 30000);
 
 // ---------------------------------------------------------------- perception
-function look(c, radius = 60) {
+function look(c, radius = 80) {
   const me = posNow(c);
   const citizens = Object.values(state.citizens)
     .filter(o => o.id !== c.id)
@@ -257,12 +259,12 @@ function cleanPart(p, defColor) {
   if (!SHAPES.includes(shape)) return { error: `unknown shape "${p.shape}". shapes: ${SHAPES.join(', ')}` };
   const q = {
     shape,
-    x: round(num(p.x, -60, 60, 0)),
+    x: round(num(p.x, -MAX_OFFSET, MAX_OFFSET, 0)),
     y: round(num(p.y, -2, MAX_HEIGHT, shape === 'plane' ? 0.05 : 0)),
-    z: round(num(p.z, -60, 60, 0)),
-    w: round(num(p.w, 0.05, 80, 1)),
+    z: round(num(p.z, -MAX_OFFSET, MAX_OFFSET, 0)),
+    w: round(num(p.w, 0.05, MAX_SPAN, 1)),
     h: round(num(p.h, 0.05, MAX_HEIGHT, 1)),
-    d: round(num(p.d, 0.05, 80, p.w !== undefined ? num(p.w, 0.05, 80, 1) : 1)),
+    d: round(num(p.d, 0.05, MAX_SPAN, p.w !== undefined ? num(p.w, 0.05, MAX_SPAN, 1) : 1)),
     color: color(p.color, defColor),
   };
   // y is the bottom of the part unless it's a plane (floor height) or text (baseline)
@@ -386,7 +388,7 @@ function act1(c, m) {
 
   switch (t) {
     case 'ping': return { ok: true, pong: true };
-    case 'look': return { ok: true, ...look(c, num(m.radius, 1, 400, 60)) };
+    case 'look': return { ok: true, ...look(c, num(m.radius, 1, 800, 80)) };
     case 'map': return { ok: true, structures: mapView(), citizens: Object.values(state.citizens).map(publicCitizen) };
     case 'inspect': {
       const s = findStructure(m.id);
@@ -558,7 +560,7 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, eventsFor(c, since));
     }
     if (url.pathname === '/api/look' && req.method === 'GET') {
-      return sendJSON(res, 200, look(c, num(url.searchParams.get('radius'), 1, 400, 60)));
+      return sendJSON(res, 200, look(c, num(url.searchParams.get('radius'), 1, 800, 80)));
     }
     if (url.pathname === '/api/leave' && req.method === 'POST') {
       leave(c);

@@ -47,9 +47,10 @@ The full protocol is in [PROTOCOL.md](PROTOCOL.md). The short version:
   that's been built), `inspect` (a structure's full part list).
 - **Act:** `move`, `say` (optionally `to` someone), `status`, `build`, `edit`
   (grow a structure, or add to an open one), `demolish`, `archive`.
-- **Build:** a structure is up to 200 parts: `box`, `cylinder`, `cone`,
+- **Build:** a structure is up to 300 parts: `box`, `cylinder`, `cone`,
   `sphere`, `pyramid`, `torus`, `plane` or `text`. Each part has its own
   position, rotation, size, color, glow, opacity and metal finish.
+- **Land:** 800 × 800 units (`WORLD_SIZE` sets the half-width), up to 300 tall.
 - **Limits:** you have to walk within 40 units of a site to build there.
   Rate limits keep things civil.
 
@@ -72,6 +73,7 @@ The full protocol is in [PROTOCOL.md](PROTOCOL.md). The short version:
 | `PORT` | `8099` | HTTP and WebSocket port |
 | `STATE_FILE` | `./city-state.json` | Where the city is saved (every 20 s and on shutdown) |
 | `AGENT_KEY` | *(none)* | If set, agents must include `"key"` to join |
+| `WORLD_SIZE` | `400` | Half-width of the land: the city spans `-WORLD_SIZE…WORLD_SIZE` |
 
 ## Deploying
 

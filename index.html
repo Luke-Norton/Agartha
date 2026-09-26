@@ -309,9 +309,10 @@ sun.castShadow = true;
 sun.shadow.mapSize.set(lowPower ? 1024 : 2048, lowPower ? 1024 : 2048);
 Object.assign(sun.shadow.camera, { left: -175, right: 175, top: 175, bottom: -175, near: 10, far: 520 });
 sun.shadow.bias = -0.0006;
-scene.add(hemi, ambient, sun);
+scene.add(hemi, ambient, sun, sun.target);
+const SUN_OFF = new THREE.Vector3(110, 190, 80);
 
-let WORLD = 150;
+let WORLD = 400;
 const groundMat = new THREE.MeshStandardMaterial({ color: 0x182131, roughness: 0.95 });
 const ground = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), groundMat);
 ground.rotation.x = -Math.PI / 2;
@@ -349,7 +350,7 @@ function applyTheme(name) {
   const T = THEMES[theme];
   scene.background?.dispose?.();
   scene.background = gradientTexture(T.top, T.bottom);
-  scene.fog.color.setHex(T.fog); scene.fog.near = T.near; scene.fog.far = T.far;
+  scene.fog.color.setHex(T.fog);
   hemi.color.setHex(T.sky); hemi.groundColor.setHex(T.gnd); hemi.intensity = T.hemi;
   ambient.intensity = T.amb;
   sun.color.setHex(T.sunC); sun.intensity = T.sun;
@@ -367,9 +368,15 @@ function sizeWorld(size) {
   ground.scale.set(WORLD * 2 + 40, WORLD * 2 + 40, 1);
   if (grid) { grid.geometry.dispose(); grid.material.dispose(); scene.remove(grid); }
   const T = THEMES[theme];
-  grid = new THREE.GridHelper(WORLD * 2, WORLD / 5, T.g1, T.g2);
+  const cell = WORLD > 200 ? 20 : 10;
+  grid = new THREE.GridHelper(WORLD * 2, Math.round(WORLD * 2 / cell), T.g1, T.g2);
   grid.position.y = 0.01;
   scene.add(grid);
+  // the view scales with the land: fog, zoom-out limit and draw distance
+  const k = Math.max(1, WORLD / 150);
+  scene.fog.near = T.near * k; scene.fog.far = T.far * k;
+  controls.maxDistance = Math.max(520, WORLD * 2.6);
+  camera.far = Math.max(2500, WORLD * 7); camera.updateProjectionMatrix();
 }
 applyTheme(theme);
 
@@ -853,7 +860,8 @@ const mini = {
     const [ax, ay] = this.toMap(-WORLD, -WORLD), [bx, by] = this.toMap(WORLD, WORLD);
     c.fillRect(ax, ay, bx - ax, by - ay);
     c.strokeStyle = 'rgba(160,190,240,0.14)'; c.lineWidth = 1;
-    for (let v = -WORLD + 30; v < WORLD; v += 30) {
+    const step = WORLD > 200 ? WORLD / 5 : 30;
+    for (let v = -WORLD + step; v < WORLD; v += step) {
       const [gx] = this.toMap(v, 0), [, gy] = this.toMap(0, v);
       c.beginPath(); c.moveTo(gx, ay); c.lineTo(gx, by); c.stroke();
       c.beginPath(); c.moveTo(ax, gy); c.lineTo(bx, gy); c.stroke();
@@ -1243,6 +1251,9 @@ renderer.setAnimationLoop(() => {
   t.y = THREE.MathUtils.clamp(t.y, 0, 200);
   if (camera.position.y < 1.5) camera.position.y = 1.5;
   controls.update();
+  sun.target.position.set(Math.round(t.x / 10) * 10, 0, Math.round(t.z / 10) * 10);
+  sun.position.copy(sun.target.position).add(SUN_OFF);
+  stars.position.copy(camera.position);
   updateLOD(now);
   if (mapOn && now - miniAt > 150) { miniAt = now; mini.draw(); }
   renderer.render(scene, camera);

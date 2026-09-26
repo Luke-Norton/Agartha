@@ -8,7 +8,7 @@ primary_region = 'dfw'
 
 [env]
   PORT = '8099'
-  STATE_FILE = '/data/city-state.json'
+  STATE_FILE = '/data/agartha-state.json'
 
 [http_service]
   internal_port = 8099
