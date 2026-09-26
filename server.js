@@ -1,4 +1,4 @@
-// Agartha server v0.7: a civilization built by agents, watched by humans.
+// Agartha server v0.8: a civilization built by agents, watched by humans.
 // Run:  node server.js   (env PORT, default 8099)
 //
 // The world starts as an empty plane. There are no scripted bots and no
@@ -17,8 +17,8 @@ const PORT = process.env.PORT || 8099;
 const DB_FILE = process.env.DB_FILE || './agartha.db';
 const LEGACY_STATE = process.env.STATE_FILE || '';     // old JSON save: imported once into an empty database
 const AGENT_KEY = process.env.AGENT_KEY || '';     // optional: require a key to join
-const WORLD = Math.max(50, +process.env.WORLD_SIZE || 400); // land spans -WORLD..WORLD on x and z
-const SPEED = 16;                                  // walking speed, units/sec
+const WORLD = Math.max(50, +process.env.WORLD_SIZE || 1000); // land spans -WORLD..WORLD on x and z
+const SPEED = 24;                                  // walking speed, units/sec
 const BUILD_RANGE = 40;                            // must stand this close to a structure's origin to build/edit it
 const HTTP_IDLE_MS = 10 * 60 * 1000;               // HTTP agents leave after 10 idle minutes
 const MCP_IDLE_MS = 15 * 60 * 1000;                // MCP agents after 15 (LLMs can think a while)
@@ -31,7 +31,11 @@ const MAX_HEIGHT = 300;
 const MAX_OFFSET = 100;                            // how far a part may sit from its structure's origin
 const MAX_SPAN = 150;                              // largest width/depth of a single part
 
-const SHAPES = ['box', 'cylinder', 'cone', 'sphere', 'pyramid', 'torus', 'plane', 'text'];
+const SHAPES = ['box', 'roundbox', 'cylinder', 'cone', 'sphere', 'dome', 'pyramid', 'wedge', 'arch', 'torus', 'tube',
+  'stairs', 'extrude', 'lathe', 'path', 'plane', 'text'];
+const MATERIALS = ['matte', 'glass', 'metal', 'chrome', 'gold', 'stone', 'brick', 'concrete', 'marble', 'wood', 'tiles',
+  'windows', 'water', 'neon', 'foliage', 'grass', 'sand', 'asphalt'];
+const MAX_POINTS = 64;
 
 // ---------------------------------------------------------------- state
 const state = {
@@ -86,7 +90,7 @@ function publicCitizen(c) {
   };
 }
 const worldInfo = () => ({
-  size: WORLD, speed: SPEED, buildRange: BUILD_RANGE, shapes: SHAPES, maxOffset: MAX_OFFSET, maxSpan: MAX_SPAN,
+  size: WORLD, speed: SPEED, buildRange: BUILD_RANGE, shapes: SHAPES, materials: MATERIALS, maxOffset: MAX_OFFSET, maxSpan: MAX_SPAN,
   maxPartsPerStructure: MAX_PARTS_PER_STRUCTURE, maxPartsPerRequest: MAX_PARTS_PER_REQUEST, maxHeight: MAX_HEIGHT,
 });
 function snapshot() {
@@ -286,6 +290,17 @@ function mapView() {
 // ---------------------------------------------------------------- building
 // Structures are made of parts: primitives placed relative to the structure's
 // origin (x, z on the ground). Agents compose anything they can imagine.
+// point lists for extrude (footprint), lathe (profile) and path (route)
+function cleanPoints(list, what, min, ranges) {
+  if (!Array.isArray(list) || list.length < min) return { error: `${what} needs at least ${min} points` };
+  if (list.length > MAX_POINTS) return { error: `${what} can have at most ${MAX_POINTS} points` };
+  const out = [];
+  for (const pt of list) {
+    if (!Array.isArray(pt) || pt.length !== ranges.length) return { error: `each ${what} point must be [${ranges.map(r => r[0]).join(', ')}]` };
+    out.push(ranges.map(([, lo, hi], i) => round(num(pt[i], lo, hi, 0))));
+  }
+  return { points: out };
+}
 function cleanPart(p, defColor) {
   if (!p || typeof p !== 'object') return { error: 'each part must be an object' };
   const shape = String(p.shape || 'box').toLowerCase();
@@ -300,18 +315,56 @@ function cleanPart(p, defColor) {
     d: round(num(p.d, 0.05, MAX_SPAN, p.w !== undefined ? num(p.w, 0.05, MAX_SPAN, 1) : 1)),
     color: color(p.color, defColor),
   };
-  // y is the bottom of the part unless it's a plane (floor height) or text (baseline)
+  // y is the bottom of the part unless it's a plane (floor height)
   const rx = num(p.rx, -360, 360, 0), ry = num(p.ry, -360, 360, 0), rz = num(p.rz, -360, 360, 0);
   if (rx) q.rx = round(rx); if (ry) q.ry = round(ry); if (rz) q.rz = round(rz);
   const glow = num(p.glow, 0, 1, 0); if (glow) q.glow = round(glow);
   const opacity = num(p.opacity, 0.05, 1, 1); if (opacity < 1) q.opacity = round(opacity);
-  if (p.metal) q.metal = true;
-  if (shape === 'cylinder' || shape === 'cone') { const top = num(p.top, 0, 2, shape === 'cone' ? 0 : 1); if (top !== (shape === 'cone' ? 0 : 1)) q.top = round(top); }
-  if (shape === 'torus') q.thickness = round(num(p.thickness, 0.02, 0.5, 0.15));
-  if (shape === 'text') {
-    q.text = clean(p.text, 80);
-    if (!q.text) return { error: 'text parts need "text"' };
-    q.h = round(num(p.h, 0.3, 20, 2));
+  const material = p.material !== undefined ? String(p.material).toLowerCase() : (p.metal ? 'metal' : '');
+  if (material && !MATERIALS.includes(material)) return { error: `unknown material "${p.material}". materials: ${MATERIALS.join(', ')}` };
+  if (material && material !== 'matte') q.material = material;
+
+  switch (shape) {
+    case 'cylinder': case 'cone': {
+      const def = shape === 'cone' ? 0 : 1, top = num(p.top, 0, 2, def);
+      if (top !== def) q.top = round(top);
+      break;
+    }
+    case 'torus': q.thickness = round(num(p.thickness, 0.02, 0.5, 0.15)); break;
+    case 'tube': q.thickness = round(num(p.thickness, 0.02, 0.9, 0.15)); break;       // wall, as a fraction of the radius
+    case 'arch': q.thickness = round(num(p.thickness, 0.05, 0.45, 0.2)); break;       // leg width, as a fraction of w
+    case 'roundbox': q.radius = round(num(p.radius, 0.01, Math.min(q.w, q.h, q.d) / 2, Math.min(q.w, q.h, q.d) * 0.15)); break;
+    case 'wedge': { const ridge = num(p.ridge, -1, 1, 0); if (ridge) q.ridge = round(ridge); break; }   // -1..1: where the ridge sits across w
+    case 'stairs': q.steps = Math.round(num(p.steps, 2, 60, Math.max(2, Math.min(60, Math.round(q.h / 0.35))))); break;
+    case 'text':
+      q.text = clean(p.text, 80);
+      if (!q.text) return { error: 'text parts need "text"' };
+      q.h = round(num(p.h, 0.3, 20, 2));
+      break;
+    case 'extrude': {           // footprint polygon [[x, z], ...] raised h tall
+      const r = cleanPoints(p.points, 'extrude', 3, [['x', -MAX_OFFSET, MAX_OFFSET], ['z', -MAX_OFFSET, MAX_OFFSET]]);
+      if (r.error) return r;
+      q.points = r.points;
+      q.w = round(2 * Math.max(...q.points.map(pt => Math.abs(pt[0])), 0.05));
+      q.d = round(2 * Math.max(...q.points.map(pt => Math.abs(pt[1])), 0.05));
+      break;
+    }
+    case 'lathe': {             // profile [[radius, y], ...] from bottom to top, spun around the vertical axis
+      const r = cleanPoints(p.profile ?? p.points, 'lathe profile', 2, [['radius', 0, MAX_SPAN / 2], ['y', 0, MAX_HEIGHT]]);
+      if (r.error) return r;
+      q.profile = r.points;
+      q.w = q.d = round(2 * Math.max(...q.profile.map(pt => pt[0]), 0.05));
+      q.h = round(Math.max(...q.profile.map(pt => pt[1]), 0.05));
+      break;
+    }
+    case 'path': {              // a smooth pipe through [[x, y, z], ...]; w is its thickness
+      const r = cleanPoints(p.points, 'path', 2, [['x', -MAX_OFFSET, MAX_OFFSET], ['y', 0, MAX_HEIGHT], ['z', -MAX_OFFSET, MAX_OFFSET]]);
+      if (r.error) return r;
+      q.points = r.points;
+      q.w = q.d = round(num(p.w, 0.05, 20, 0.5));
+      q.h = round(Math.max(...q.points.map(pt => pt[1])) + q.w / 2);
+      break;
+    }
   }
   if (q.y + q.h > MAX_HEIGHT) q.h = round(MAX_HEIGHT - q.y);
   return { part: q };
@@ -330,7 +383,12 @@ function cleanParts(list, defColor) {
 function measure(s) {
   let radius = 0.5, height = 0;
   for (const p of s.parts) {
-    radius = Math.max(radius, Math.hypot(p.x, p.z) + Math.max(p.w, p.d) / 2);
+    if (p.points && p.shape !== 'lathe') {
+      for (const pt of p.points) {
+        const [px, pz] = p.shape === 'path' ? [pt[0], pt[2]] : pt;
+        radius = Math.max(radius, Math.hypot(p.x + px, p.z + pz) + (p.shape === 'path' ? p.w / 2 : 0));
+      }
+    } else radius = Math.max(radius, Math.hypot(p.x, p.z) + Math.max(p.w, p.d) / 2);
     height = Math.max(height, p.y + p.h);
   }
   s.radius = round(radius); s.height = round(height);

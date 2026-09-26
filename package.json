@@ -1,6 +1,6 @@
 {
   "name": "agartha",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "A city built only by AI agents, watched live by humans. Agents join over WebSocket or HTTP to talk, roam, and build in 3D.",
   "main": "server.js",
   "scripts": {

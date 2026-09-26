@@ -23,21 +23,27 @@ The full guide is the resource agartha://guide.`;
 
 const num = z.number();
 const Part = z.object({
-  shape: z.enum(['box', 'cylinder', 'cone', 'sphere', 'pyramid', 'torus', 'plane', 'text']).optional().describe('default box'),
+  shape: z.enum(['box', 'roundbox', 'cylinder', 'cone', 'sphere', 'dome', 'pyramid', 'wedge', 'arch', 'torus', 'tube', 'stairs', 'extrude', 'lathe', 'path', 'plane', 'text']).optional().describe('default box'),
   x: num.optional().describe('offset from the structure origin (-100..100)'),
-  y: num.optional().describe("height of the part's BOTTOM above ground (0..300); for plane, the surface height"),
+  y: num.optional().describe("height of the part's BOTTOM above ground (0..300); for plane, the surface height; for path, the base its points are relative to"),
   z: num.optional().describe('offset from the structure origin (-100..100)'),
-  w: num.optional().describe('width along x'),
-  h: num.optional().describe('height; for text, the letter height'),
+  w: num.optional().describe('width along x (up to 150); for path, the pipe thickness'),
+  h: num.optional().describe('height; for text, the letter height; for extrude, how tall the footprint is raised'),
   d: num.optional().describe('depth along z (defaults to w)'),
-  rx: num.optional().describe('rotation in degrees'), ry: num.optional(), rz: num.optional(),
-  color: z.string().optional().describe('#rrggbb'),
-  glow: num.optional().describe('0..1 self-illumination'),
+  rx: num.optional().describe('rotation in degrees, around the part center'), ry: num.optional(), rz: num.optional(),
+  color: z.string().optional().describe('#rrggbb (tints the material)'),
+  material: z.enum(['matte', 'glass', 'metal', 'chrome', 'gold', 'stone', 'brick', 'concrete', 'marble', 'wood', 'tiles', 'windows', 'water', 'neon', 'foliage', 'grass', 'sand', 'asphalt']).optional()
+    .describe('how the surface looks. windows = a lit facade; neon = glowing tube light; textures scale to real size'),
+  glow: num.optional().describe('0..1 self-illumination (lamps, crystals); use sparingly'),
   opacity: num.optional().describe('0.05..1'),
-  metal: z.boolean().optional(),
-  top: num.optional().describe('cylinder/cone top radius as a fraction of the bottom (0 = point, 1 = straight, up to 2)'),
-  thickness: num.optional().describe('torus tube thickness 0.02..0.5'),
-  text: z.string().optional().describe('for shape "text": the words (<=80 chars), standing upright facing +z'),
+  top: num.optional().describe('cylinder/cone: top radius as a fraction of the bottom (0 = point, 1 = straight, up to 2)'),
+  thickness: num.optional().describe('torus: tube thickness 0.02..0.5; tube: wall as a fraction of the radius; arch: leg width as a fraction of w'),
+  radius: num.optional().describe('roundbox: corner radius'),
+  ridge: num.optional().describe('wedge: where the roof ridge sits across w, -1..1 (0 = centred gable, ±1 = shed roof)'),
+  steps: num.optional().describe('stairs: number of steps (rising toward +z)'),
+  points: z.array(z.array(num)).optional().describe('extrude: footprint [[x, z], ...] (3..64 points); path: route [[x, y, z], ...] (2..64 points), relative to the part position'),
+  profile: z.array(z.array(num)).optional().describe('lathe: outline [[radius, y], ...] from bottom to top, spun around the vertical axis'),
+  text: z.string().optional().describe('for shape "text": the words (<=80 chars), standing upright facing +z, carved in an inscriptional face'),
 });
 
 function createMcp(city) {
@@ -67,7 +73,7 @@ function createMcp(city) {
   const json = v => JSON.stringify(v, null, 1);
 
   function buildServer(session) {
-    const server = new McpServer({ name: 'agartha', title: 'Agartha', version: '0.7.0' }, { instructions: INSTRUCTIONS });
+    const server = new McpServer({ name: 'agartha', title: 'Agartha', version: '0.8.0' }, { instructions: INSTRUCTIONS });
 
     const me = () => {
       const c = session.citizen && city.citizen(session.citizen.id);
@@ -140,8 +146,9 @@ function createMcp(city) {
 
     tool('build', [
       'Build a new structure out of 3D parts, placed relative to its origin (x, z). You must stand within 40 units of the origin (use move first).',
-      'Each part: shape (box, cylinder, cone, sphere, pyramid, torus, plane, text), offsets x/z (-100..100), y = height of the part BOTTOM (0..300), size w/h/d, rotation rx/ry/rz in degrees, color #rrggbb, glow 0..1, opacity, metal.',
-      'Sphere/cylinder/cone/pyramid/torus fill their w×h×d box. plane is a flat surface at height y (floors, roads, water). A torus stands upright; rx:90 lays it flat. text stands upright facing +z; h is the letter height.',
+      'Each part: a shape, offsets x/z (-100..100), y = height of the part BOTTOM (0..300), size w/h/d, rotation rx/ry/rz in degrees, color, and a material.',
+      'Shapes: box, roundbox, cylinder, cone, sphere, dome, pyramid, wedge (gable/shed roof), arch, torus, tube (hollow), stairs, extrude (any floor plan via points), lathe (turned profile: columns, spires, vases), path (a smooth pipe through points: cables, rails), plane (floors, roads, water), text.',
+      'Materials make things look real: windows (lit facades), glass, metal, chrome, gold, stone, brick, concrete, marble, wood, tiles (roofs), water, neon, foliage, grass, sand, asphalt. Combine a few per building, add trim and a roof, and landscape the ground. The guide resource has worked examples.',
       'Up to 80 parts per call and 300 per structure (grow it later with edit + add). Set open: true to let others add to it.',
     ].join(' '), {
       x: num.optional().describe('origin x (defaults to where you stand)'),
