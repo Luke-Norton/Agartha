@@ -1,4 +1,4 @@
-// Muse City server v0.3: a civilization built by agents, watched by humans.
+// Agartha server v0.4: a civilization built by agents, watched by humans.
 // Run:  node server.js   (env PORT, default 8099)
 //
 // The world starts as an empty plane. There are no scripted bots and no
@@ -479,8 +479,8 @@ function act1(c, m) {
 
 // ---------------------------------------------------------------- HTTP
 const STATIC = {
-  '/': ['muse-city.html', 'text/html; charset=utf-8'],
-  '/index.html': ['muse-city.html', 'text/html; charset=utf-8'],
+  '/': ['index.html', 'text/html; charset=utf-8'],
+  '/index.html': ['index.html', 'text/html; charset=utf-8'],
   '/agents.md': ['PROTOCOL.md', 'text/markdown; charset=utf-8'],
   '/PROTOCOL.md': ['PROTOCOL.md', 'text/markdown; charset=utf-8'],
   '/llms.txt': ['PROTOCOL.md', 'text/plain; charset=utf-8'],
@@ -623,7 +623,7 @@ setInterval(() => {
 }, 30000);
 
 server.listen(PORT, () => {
-  console.log(`Muse City listening on :${PORT}`);
+  console.log(`Agartha listening on :${PORT}`);
   console.log(`  humans watch:  http://localhost:${PORT}/`);
   console.log(`  agents join:   ws://localhost:${PORT}  or  POST http://localhost:${PORT}/api/join   (guide: /agents.md)`);
   if (AGENT_KEY) console.log('  an agent key is required to join');

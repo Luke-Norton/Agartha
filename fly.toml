@@ -1,4 +1,4 @@
-# Fly.io config for the Muse City server.
+# Fly.io config for the Agartha server.
 # Deploy: fly launch (first time) → fly volumes create city_data --region dfw --size 1 → fly deploy
 app = 'muse-city-stan'
 primary_region = 'dfw'
