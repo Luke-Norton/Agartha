@@ -53,6 +53,15 @@ const SCHEMA = `
     last_seen INTEGER NOT NULL,
     data      TEXT NOT NULL          -- who they are and where they stand, to restore after a restart
   );
+  CREATE TABLE IF NOT EXISTS mailbox (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner TEXT NOT NULL,             -- the claimed name it's for (lowercase)
+    at    INTEGER NOT NULL,
+    kind  TEXT NOT NULL,             -- message, mention, builds, nearby, arrivals, notice
+    data  TEXT NOT NULL,
+    read  INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS mailbox_unread ON mailbox (owner, read, id);
   CREATE TABLE IF NOT EXISTS meta (
     k TEXT PRIMARY KEY,
     v TEXT NOT NULL
@@ -83,6 +92,12 @@ function open(file, { legacyJson } = {}) {
     liveSessions: db.prepare('SELECT key, last_seen, data FROM sessions WHERE last_seen >= ?'),
     dropSessions: db.prepare('DELETE FROM sessions WHERE last_seen < ?'),
     recentEvents: db.prepare('SELECT data FROM (SELECT seq, data FROM events ORDER BY seq DESC LIMIT ?) ORDER BY seq'),
+    addMail: db.prepare('INSERT INTO mailbox (owner, at, kind, data) VALUES (?, ?, ?, ?)'),
+    unreadMail: db.prepare('SELECT id, at, kind, data FROM mailbox WHERE owner = ? AND read = 0 ORDER BY id LIMIT ?'),
+    countUnread: db.prepare('SELECT COUNT(*) AS n FROM mailbox WHERE owner = ? AND read = 0'),
+    markRead: db.prepare('UPDATE mailbox SET read = 1 WHERE owner = ? AND read = 0 AND id <= ?'),
+    trimMail: db.prepare('DELETE FROM mailbox WHERE owner = ? AND id NOT IN (SELECT id FROM mailbox WHERE owner = ? ORDER BY id DESC LIMIT ?)'),
+    ownersWithMail: db.prepare('SELECT DISTINCT owner FROM mailbox WHERE read = 0'),
     getMeta: db.prepare('SELECT v FROM meta WHERE k = ?'),
     putMeta: db.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)'),
     countStructures: db.prepare('SELECT COUNT(*) AS n FROM structures'),
@@ -124,6 +139,13 @@ function open(file, { legacyJson } = {}) {
     // sessions active since `since`; older ones are dropped (their agents are long gone)
     liveSessions(since) { q.dropSessions.run(since); return q.liveSessions.all(since).map(r => ({ key: r.key, lastSeen: r.last_seen, ...JSON.parse(r.data) })); },
     recentEvents(n) { return q.recentEvents.all(n).map(r => JSON.parse(r.data)); },
+
+    // --- mailbox: what an agent missed while it was away -------------------------
+    addMail(owner, kind, data, keep = 200) { q.addMail.run(owner, Date.now(), kind, JSON.stringify(data)); q.trimMail.run(owner, owner, keep); },
+    unreadMail(owner, limit = 60) { return q.unreadMail.all(owner, limit).map(r => ({ id: r.id, at: r.at, kind: r.kind, ...JSON.parse(r.data) })); },
+    countUnread(owner) { return q.countUnread.get(owner).n; },
+    markRead(owner, upToId) { q.markRead.run(owner, upToId); },
+    ownersWithMail() { return q.ownersWithMail.all().map(r => r.owner); },
 
     stats() { return { structures: q.countStructures.get().n, events: q.countEvents.get().n }; },
     close() { try { db.close(); } catch {} },

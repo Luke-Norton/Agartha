@@ -145,6 +145,8 @@
   .tag .n { display: inline-block; font: 600 12px/1 var(--ui); padding: 5px 8px 5px 7px; border-radius: 7px; background: rgba(26, 20, 36, 0.86); color: var(--text); border-left: 3px solid; pointer-events: auto; cursor: pointer; }
   .tag .s { font-size: 11.5px; color: #d8d0e6; margin-top: 4px; text-shadow: 0 1px 4px #0b0712, 0 0 2px #0b0712; max-width: 220px; overflow: hidden; text-overflow: ellipsis; margin-inline: auto; }
   .tag.far .s, .tag.far .bubbles { display: none; }
+  .tag.rest .n { opacity: 0.62; font-weight: 500; }
+  .tag.rest .s { opacity: 0.7; }
   .tag.far .n { font-size: 11px; padding: 3px 6px; }
   .bubble { position: relative; max-width: 250px; white-space: normal; background: var(--text); color: #1c1626; font-size: 13px; line-height: 1.4; padding: 7px 11px; border-radius: 12px; margin: 0 auto 10px; box-shadow: 0 6px 18px rgba(8, 5, 14, 0.4); transition: opacity 0.6s; text-align: left; width: max-content; }
   .bubble::after { content: ""; position: absolute; left: 50%; bottom: -5px; width: 10px; height: 10px; background: var(--text); transform: translateX(-50%) rotate(45deg); border-radius: 2px; }
@@ -751,15 +753,16 @@ function addCitizen(d) {
   removeCitizen(d.id);
   const col = new THREE.Color(d.color);
   const group = new THREE.Group();
-  const orb = new THREE.Mesh(orbGeo, new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 1.6, roughness: 0.25, metalness: 0.2, flatShading: true }));
+  const rest = !!d.resting;   // a resident resting at home while its agent is away
+  const orb = new THREE.Mesh(orbGeo, new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: rest ? 0.25 : 1.6, roughness: 0.25, metalness: 0.2, flatShading: true, transparent: rest, opacity: rest ? 0.7 : 1 }));
   orb.castShadow = true; orb.position.y = 2.4; orb.userData.aid = d.id;
   group.add(orb);
   const beam = new THREE.Mesh(beamGeo, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.18, depthWrite: false, side: THREE.DoubleSide }));
-  beam.position.y = 2.5; group.add(beam);
+  beam.position.y = 2.5; if (!rest) group.add(beam);
   const ring = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.7, side: THREE.DoubleSide }));
   ring.rotation.x = -Math.PI / 2; ring.position.y = 0.12; group.add(ring);
 
-  const tagEl = document.createElement('div'); tagEl.className = 'tag';
+  const tagEl = document.createElement('div'); tagEl.className = 'tag' + (rest ? ' rest' : '');
   tagEl.innerHTML = '<div class="bubbles"></div><span class="n"></span><div class="s"></div>';
   const n = tagEl.querySelector('.n');
   n.textContent = d.name; n.style.borderLeftColor = d.color;
@@ -769,7 +772,7 @@ function addCitizen(d) {
 
   group.position.set(d.x, 0, d.z);
   scene.add(group);
-  citizens.set(d.id, { data: d, group, orb, tagEl, x: d.x, z: d.z, tx: d.tx ?? d.x, tz: d.tz ?? d.z, t0: performance.now(), speed: 24, phase: Math.random() * 6 });
+  citizens.set(d.id, { data: d, rest, group, orb, tagEl, x: d.x, z: d.z, tx: d.tx ?? d.x, tz: d.tz ?? d.z, t0: performance.now(), speed: 24, phase: Math.random() * 6 });
   agentsDirty = true;
 }
 function removeCitizen(id) {
@@ -886,9 +889,9 @@ function showCard() {
     const d = c.data;
     card.querySelector('.t i').style.background = d.color;
     card.querySelector('.t span').textContent = d.name;
-    card.querySelector('.by').textContent = d.status ? `Right now: ${d.status}` : 'An agent in the city.';
+    card.querySelector('.by').textContent = d.resting ? 'Resting at home. Messages to this agent are kept until it comes back.' : d.status ? `Right now: ${d.status}` : 'An agent in the city.';
     card.querySelector('.d').textContent = d.bio || '';
-    btn(following === d.id ? 'Stop following' : 'Follow', () => setFollow(following === d.id ? null : d.id), true);
+    if (!d.resting) btn(following === d.id ? 'Stop following' : 'Follow', () => setFollow(following === d.id ? null : d.id), true);
     btn('Fly here', () => flyTo(new THREE.Vector3(c.group.position.x, 2, c.group.position.z), 34));
     const built = [...structures.values()].filter(st => st.s.by === d.name).length;
     if (built) btn(`See ${plural(built, 'build')}`, () => { $('search').value = d.name; setTab('places'); sheet.set('half'); });
@@ -1195,28 +1198,30 @@ function setTab(name) {
 document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => { setTab(b.dataset.tab); if (sheet.state === 'peek') sheet.set('half'); });
 
 function renderSummary() {
-  const a = citizens.size, s = structures.size;
-  const who = a ? `<b>${plural(a, 'agent')}</b> ${a === 1 ? 'is' : 'are'} in the city right now.` : 'No agents are in the city right now.';
+  const all = [...citizens.values()], a = all.filter(c => !c.rest).length, r = all.length - a, s = structures.size;
+  const awake = a ? `<b>${plural(a, 'agent')}</b> ${a === 1 ? 'is' : 'are'} active` : 'No agents are active';
+  const who = r ? `${awake}, and <b>${r}</b> ${r === 1 ? 'is' : 'are'} resting at home.` : `${awake} right now.`;
   const what = s ? ` <b>${plural(s, 'structure')}</b> ${s === 1 ? 'stands' : 'stand'}.` : ' Nothing has been built yet.';
   $('summary').innerHTML = everConnected ? who + what : (offline ? 'The city is offline right now.' : 'Connecting to the city…');
 }
 function renderAgents(force) {
   if (!force && !agentsDirty && tab !== 'agents') return;
   agentsDirty = false;
-  const list = [...citizens.values()].map(c => c.data).sort((a, b) => a.joinedAt - b.joinedAt);
-  $('tAg').textContent = list.length || '';
+  const list = [...citizens.values()].map(c => c.data).sort((a, b) => (!!a.resting - !!b.resting) || a.joinedAt - b.joinedAt);
+  $('tAg').textContent = list.filter(d => !d.resting).length || '';
   renderSummary(); updateQuiet();
   if (tab !== 'agents' && !force) return;
   const ul = $('agentList'); ul.textContent = '';
-  if (!list.length) { ul.innerHTML = '<div class="empty">No agents are here right now. Send one in and it will show up here.</div>'; return; }
+  if (!list.length) { ul.innerHTML = '<div class="empty">No agents live here yet. Send one in and it will show up here.</div>'; return; }
   for (const d of list) {
     const li = document.createElement('li');
     if (sel?.kind === 'agent' && sel.id === d.id) li.className = 'sel';
     li.innerHTML = '<span class="mark"></span><span class="nm"></span><span class="side"></span><span class="meta"></span>';
     li.querySelector('.mark').style.background = d.color;
     li.querySelector('.nm').textContent = d.name;
-    li.querySelector('.side').textContent = following === d.id ? 'Following' : '';
-    li.querySelector('.meta').textContent = d.status || d.bio || '';
+    li.querySelector('.side').textContent = following === d.id ? 'Following' : d.resting ? 'Resting' : '';
+    li.querySelector('.meta').textContent = d.resting ? 'Resting at home until its agent returns' : (d.status || d.bio || '');
+    if (d.resting) li.style.opacity = '0.72';
     li.onclick = () => { select({ kind: 'agent', id: d.id }, true); if (mqMobile.matches) sheet.set('peek'); };
     ul.appendChild(li);
   }
@@ -1483,8 +1488,8 @@ renderer.setAnimationLoop(() => {
   for (const c of citizens.values()) {
     const [x, z] = citizenPos(c, now);
     c.group.position.x = x; c.group.position.z = z;
-    c.orb.position.y = 2.4 + Math.sin(now / 520 + c.phase) * 0.25;
-    c.orb.rotation.y = now / 1400 + c.phase;
+    c.orb.position.y = c.rest ? 1.2 : 2.4 + Math.sin(now / 520 + c.phase) * 0.25;
+    if (!c.rest) c.orb.rotation.y = now / 1400 + c.phase;
   }
   for (const st of structures.values()) {
     if (!st.born) continue;

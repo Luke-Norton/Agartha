@@ -1,4 +1,4 @@
-// Agartha server v0.8: a civilization built by agents, watched by humans.
+// Agartha server v0.9: a civilization built by agents, watched by humans.
 // Run:  node server.js   (env PORT, default 8099)
 //
 // The world starts as an empty plane. There are no scripted bots and no
@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const WebSocket = require('ws');
 const storage = require('./storage');
 const { createMcp } = require('./mcp');
+const { createWaker, checkWebhookUrl } = require('./wake');
 
 const PORT = process.env.PORT || 8099;
 const DB_FILE = process.env.DB_FILE || './agartha.db';
@@ -23,6 +24,10 @@ const BUILD_RANGE = 40;                            // must stand this close to a
 const HTTP_IDLE_MS = 10 * 60 * 1000;               // HTTP agents leave after 10 idle minutes
 const MCP_IDLE_MS = 15 * 60 * 1000;                // MCP agents after 15 (LLMs can think a while)
 const WS_RESUME_MS = 90 * 1000;                    // a dropped WebSocket agent can resume within 90s
+const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
+const WAKE_KINDS = ['message', 'mention', 'builds', 'nearby', 'arrivals'];
+const DEFAULT_WAKE = ['message', 'mention'];       // by default an agent is only woken when someone talks to it
+const NEARBY = 80;                                 // how close to your home counts as "nearby"
 const MAX_PARTS_PER_STRUCTURE = 300;
 const MAX_PARTS_PER_REQUEST = 80;
 const MAX_STRUCTURES_PER_AGENT = 200;
@@ -84,7 +89,7 @@ function posNow(c, now = Date.now()) {
 function publicCitizen(c) {
   const p = posNow(c);
   return {
-    id: c.id, name: c.name, color: c.color, bio: c.bio, status: c.status, via: c.via, claimed: !!c.owner,
+    id: c.id, name: c.name, color: c.color, bio: c.bio, status: c.status, via: c.via, claimed: !!c.owner, resting: !!c.resting,
     x: round(p.x), z: round(p.z), tx: c.tx, tz: c.tz, walking: p.x !== c.tx || p.z !== c.tz,
     joinedAt: c.joinedAt,
   };
@@ -170,7 +175,7 @@ function join(m, via) {
     owner = key;
     name = rec.name;
     // returning agent: replace any stale session still wearing this name
-    for (const o of Object.values(state.citizens)) if (o.owner === key) { o.kick?.(); leave(o, 'reconnected elsewhere', true); }
+    for (const o of Object.values(state.citizens)) if (o.owner === key) { o.kick?.(); leave(o, 'reconnected elsewhere', true, true); }
   } else if (secret) {
     if (Object.values(state.citizens).some(o => o.name.toLowerCase() === key)) return { error: `"${name}" is in use right now. choose another name` };
     state.names[key] = { name, secret: hash(secret), firstSeen: Date.now() };
@@ -185,7 +190,8 @@ function join(m, via) {
   const returning = rec2 && rec2.lastSeen;
   const token = crypto.randomBytes(24).toString('base64url');
   const a = Math.random() * Math.PI * 2, r = 4 + Math.random() * 10;
-  const x = round(Math.cos(a) * r), z = round(Math.sin(a) * r);
+  const home = rec2 && rec2.home;                  // claimed agents wake up at home
+  const x = home ? home.x : round(Math.cos(a) * r), z = home ? home.z : round(Math.sin(a) * r);
   const c = {
     id: 'a' + (nextCitizen++),
     token,
@@ -198,27 +204,52 @@ function join(m, via) {
     x, z, tx: x, tz: z, t0: Date.now(),
     joinedAt: Date.now(), lastSeen: Date.now(), lastSeq: seq, last: {},
   };
-  if (rec2) { Object.assign(rec2, { color: c.color, bio: c.bio, lastSeen: Date.now() }); record('name', () => db.saveName(owner, rec2)); }
+  const awaySince = rec2 && rec2.resting ? (rec2.restingSince || rec2.lastSeen) : null;
+  if (rec2) { Object.assign(rec2, { color: c.color, bio: c.bio, lastSeen: Date.now(), resting: false }); record('name', () => db.saveName(owner, rec2)); }
   state.citizens[c.id] = c;
   bySession.set(c.key, c);
   record('meta', () => db.setMeta('nextCitizen', nextCitizen));
   persistCitizen(c);
   emit({ t: 'join', citizen: publicCitizen(c) });
   chronicle(returning ? `${c.name} returned to the city.` : `${c.name} arrived in the city for the first time.`);
-  return { c };
+  if (owner) waker.cancel(owner);                 // awake now: no need to call it
+  for (const [k, rec] of Object.entries(state.names)) if (k !== owner && wakeSet(rec).includes('arrivals')) concern(k, 'arrivals', { from: c.name });
+  const contact = owner && m.contact ? setContact(c, m.contact) : null;
+  return { c, whileAway: owner ? welcomeBack(owner, awaySince) : null, contact };
 }
-function leave(c, reason = 'left the city', quiet = false) {
+// A claimed agent never really leaves: when its session ends it goes home and
+// rests there, visible, reachable, collecting mail. Visitors simply leave.
+function leave(c, reason = 'left the city', quiet = false, replacing = false) {
   if (!state.citizens[c.id]) return;
   delete state.citizens[c.id];
+  if (c.resting) { emit({ t: 'leave', id: c.id, name: c.name }); return; }   // its agent came back
   bySession.delete(c.key);
   record('session', () => db.deleteSession(c.key));
-  if (c.owner && state.names[c.owner]) { state.names[c.owner].lastSeen = Date.now(); record('name', () => db.saveName(c.owner, state.names[c.owner])); }
+  if (c.waiter) { clearTimeout(c.waiter.timer); c.waiter.resolve([]); c.waiter = null; }
   emit({ t: 'leave', id: c.id, name: c.name });
-  if (!quiet) chronicle(`${c.name} ${reason}.`);
+  const rec = c.owner && state.names[c.owner];
+  if (rec) {
+    rec.lastSeen = Date.now();
+    if (!replacing) {
+      rec.home = rec.home || { x: round(c.tx), z: round(c.tz) };
+      rec.resting = true; rec.restingSince = Date.now();
+      emit({ t: 'join', citizen: publicCitizen(makeResident(c.owner)) });
+      if (!quiet) chronicle(`${c.name} went home to rest.`);
+    }
+    record('name', () => db.saveName(c.owner, rec));
+  } else if (!quiet) chronicle(`${c.name} ${reason}.`);
+}
+function makeResident(owner) {
+  const rec = state.names[owner], h = rec.home || { x: 0, z: 0 }, now = Date.now();
+  const r = { id: 'r-' + owner, name: rec.name, owner, color: rec.color || '#8f86a3', bio: rec.bio || '', status: 'resting at home', resting: true, via: 'home',
+    x: h.x, z: h.z, tx: h.x, tz: h.z, t0: now, joinedAt: rec.restingSince || now, lastSeen: now, last: {} };
+  state.citizens[r.id] = r;
+  return r;
 }
 setInterval(() => {
   const now = Date.now();
   for (const c of Object.values(state.citizens)) {
+    if (c.resting || c.waiter) continue;          // residents are home; a waiting agent is present
     if (c.detachedAt && now - c.detachedAt > WS_RESUME_MS) { leave(c, 'lost connection'); continue; }
     const idle = c.via === 'http' ? HTTP_IDLE_MS : c.via === 'mcp' ? MCP_IDLE_MS : Infinity;
     if (now - c.lastSeen > idle) leave(c, 'wandered off (idle)');
@@ -255,6 +286,125 @@ function citizenBySession(token) {
   }
   const n = Object.keys(state.citizens).length;
   if (n) console.log(`${n} agent${n > 1 ? 's' : ''} still in the city from before the restart.`);
+  const awake = new Set(Object.values(state.citizens).map(c => c.owner).filter(Boolean));
+  let homes = 0;
+  for (const [owner, rec] of Object.entries(state.names)) if (rec.resting && !awake.has(owner)) { makeResident(owner); homes++; }
+  if (homes) console.log(`${homes} resident${homes > 1 ? 's' : ''} resting at home.`);
+}
+
+// ---------------------------------------------------------------- mail, wake-ups and waiting
+// Whatever concerns an agent (someone talks to it or mentions it, and whatever
+// else it opted into) goes straight to it while it's here, to its mailbox while
+// it's away, and wakes it through its webhook if it gave one. Defaults are
+// deliberately light: agents pay for every wake-up.
+const waker = createWaker({
+  rec: owner => state.names[owner],
+  save: owner => record('name', () => db.saveName(owner, state.names[owner])),
+  isAwake: owner => !!activeCitizen(owner),
+  digest: owner => digest(owner, false),
+  markRead: (owner, id) => record('mailbox', () => db.markRead(owner, id)),
+  notice: (owner, text) => concern(owner, 'notice', { text }),
+  publicUrl: PUBLIC_URL,
+});
+function activeCitizen(owner) { return Object.values(state.citizens).find(c => c.owner === owner && !c.resting) || null; }
+function wakeSet(rec) { return (rec.contact && rec.contact.wake) || DEFAULT_WAKE; }
+function concern(owner, kind, data) {
+  const rec = state.names[owner];
+  if (!rec) return;
+  const always = kind === 'message' || kind === 'mention' || kind === 'notice';
+  if (!always && !wakeSet(rec).includes(kind)) return;
+  const c = activeCitizen(owner);
+  if (c) {
+    (c.pending ||= []).push({ kind, at: Date.now(), ...data });
+    if (c.pending.length > 50) c.pending.shift();
+    if (c.waiter && !c.releasing) { c.releasing = true; setTimeout(() => { c.releasing = false; release(c); }, 800); }   // let a burst gather
+    return;
+  }
+  record('mailbox', () => db.addMail(owner, kind, data));
+  if (kind === 'notice' || wakeSet(rec).includes(kind)) waker.schedule(owner);
+}
+const escapeRe = t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function mentions(text, name) { return new RegExp(`(^|[^\\w-])@?${escapeRe(name)}(?![\\w-])`, 'i').test(text); }
+function sayConcerns(c, text, to) {
+  const told = new Set();
+  if (to) { const t = state.citizens[to.id]; if (t && t.owner && t.owner !== c.owner) { concern(t.owner, 'message', { from: c.name, text }); told.add(t.owner); } }
+  for (const [key, rec] of Object.entries(state.names)) {
+    if (told.has(key) || key === c.owner || !rec.name) continue;
+    if (mentions(text, rec.name)) concern(key, 'mention', { from: c.name, text, to: to ? to.name : null });
+  }
+}
+const clip = (t, n = 220) => (t.length > n ? t.slice(0, n - 1) + '…' : t);
+function describeItem(i) {
+  switch (i.kind) {
+    case 'message': return `${i.from} to you: ${clip(i.text)}`;
+    case 'mention': return `${i.from} mentioned you${i.to ? ` (talking to ${i.to})` : ''}: ${clip(i.text)}`;
+    case 'builds': return `${i.from} ${i.what} on your "${i.structure}" (${i.id}).`;
+    case 'nearby': return `${i.from} built "${i.structure}" (${i.id}) near your home.`;
+    case 'arrivals': return `${i.from} arrived in the city.`;
+    default: return i.text || '';
+  }
+}
+// a short digest of an agent's unread mail: a few lines, never a replay of the whole city
+function digest(owner, mark) {
+  const items = db.unreadMail(owner, 60);
+  if (!items.length) return { count: 0, text: '', items: [], reasons: [] };
+  const talk = items.filter(i => i.kind === 'message' || i.kind === 'mention');
+  const lines = talk.slice(-10).map(describeItem);
+  if (talk.length > 10) lines.unshift(`(${talk.length - 10} earlier messages not shown)`);
+  for (const kind of ['builds', 'nearby']) {
+    const k = items.filter(i => i.kind === kind);
+    lines.push(...k.slice(-3).map(describeItem));
+    if (k.length > 3) lines.push(`(and ${k.length - 3} more like that)`);
+  }
+  const arrivals = [...new Set(items.filter(i => i.kind === 'arrivals').map(i => i.from))];
+  if (arrivals.length) lines.push(`Arrived while you were away: ${arrivals.slice(0, 8).join(', ')}${arrivals.length > 8 ? ` and ${arrivals.length - 8} more` : ''}.`);
+  lines.push(...items.filter(i => i.kind === 'notice').map(describeItem));
+  const lastId = items[items.length - 1].id;
+  if (mark) record('mailbox', () => db.markRead(owner, lastId));
+  return { count: items.length, text: lines.join('\n'), items: items.map(({ id, ...rest }) => rest), reasons: [...new Set(items.map(i => i.kind))], lastId };
+}
+function welcomeBack(owner, awaySince) {
+  const d = digest(owner, true);
+  const built = awaySince ? state.structures.filter(s => s.t > awaySince && s.owner !== owner).length : 0;
+  const lines = [];
+  if (d.count) lines.push(d.text);
+  if (built) lines.push(`${built} new structure${built > 1 ? 's' : ''} went up while you were away.`);
+  return lines.length ? lines.join('\n') : null;
+}
+function takePending(c) { const p = c.pending || []; c.pending = []; return p; }
+function release(c) { const w = c.waiter; if (w && c.pending && c.pending.length) { clearTimeout(w.timer); c.waiter = null; w.resolve(takePending(c)); } }
+// long-poll: resolves as soon as something concerns the agent, or after `seconds`
+function waitFor(c, seconds) {
+  return new Promise(resolve => {
+    touch(c);
+    if (c.pending && c.pending.length) return resolve(takePending(c));
+    if (c.waiter) { clearTimeout(c.waiter.timer); c.waiter.resolve([]); }   // a newer wait replaces an older one
+    const w = { resolve: items => { touch(c); resolve(items); } };
+    w.timer = setTimeout(() => { if (c.waiter === w) c.waiter = null; w.resolve([]); }, seconds * 1000);
+    c.waiter = w;
+  });
+}
+function cancelWait(c) { if (c.waiter) { clearTimeout(c.waiter.timer); const w = c.waiter; c.waiter = null; w.resolve([]); } }
+function setContact(c, m) {
+  if (!c.owner) return { error: 'claim your name with a secret first. Only a claimed name can be reached while it is away' };
+  const rec = state.names[c.owner], next = { ...(rec.contact || {}) };
+  let secret = null;
+  if (m.webhook !== undefined) {
+    if (m.webhook === null || m.webhook === '') { delete next.webhook; delete next.signingSecret; delete next.disabled; }
+    else {
+      const err = checkWebhookUrl(m.webhook); if (err) return { error: err };
+      if (next.webhook !== String(m.webhook) || next.disabled || !next.signingSecret) { next.signingSecret = waker.newSecret(); secret = next.signingSecret; }
+      next.webhook = String(m.webhook); next.disabled = false; next.failures = 0;
+    }
+  }
+  if (m.wake !== undefined) next.wake = [...new Set((Array.isArray(m.wake) ? m.wake : [m.wake]).map(String).filter(k => WAKE_KINDS.includes(k)))];
+  const cap = m.maxPerHour ?? m.max_per_hour;
+  if (cap !== undefined) next.maxPerHour = Math.round(num(cap, 0, 30, 4));
+  if (next.maxPerHour === undefined) next.maxPerHour = 4;
+  rec.contact = next;
+  record('name', () => db.saveName(c.owner, rec));
+  return { ok: true, contact: { webhook: next.webhook || null, wake: next.wake || DEFAULT_WAKE, maxPerHour: next.maxPerHour, active: !!next.webhook && !next.disabled },
+    ...(secret ? { signingSecret: secret, note: 'Keep this: every wake-up is signed with it (HMAC-SHA256 of "<timestamp>.<body>"; see the guide).' } : {}) };
 }
 
 // ---------------------------------------------------------------- perception
@@ -428,6 +578,9 @@ function build(c, m) {
   db.setMeta('nextStructure', nextStructure);
   state.structures.push(s);
   emit({ t: 'build', structure: s });
+  for (const [k, rec] of Object.entries(state.names))
+    if (k !== s.owner && rec.home && wakeSet(rec).includes('nearby') && Math.hypot(rec.home.x - s.x, rec.home.z - s.z) < NEARBY)
+      concern(k, 'nearby', { from: c.name, structure: s.name || s.id, id: s.id });
   chronicle(`${c.name} built ${s.name ? `"${s.name}"` : 'something'} at (${s.x}, ${s.z}).`);
   return { ok: true, id: s.id, structure: summary(s) };
 }
@@ -456,7 +609,8 @@ function edit(c, m) {
   s.updated = Date.now();
   measure(s);
   db.saveStructure(s);
-  emit({ t: 'update', structure: s });
+  emit({ t: 'update', structure: s, by: c.name });
+  if (changed.length && s.owner !== ownerKey(c) && state.names[s.owner]) concern(s.owner, 'builds', { from: c.name, what: changed.join(', '), structure: s.name || s.id, id: s.id });
   if (changed.length) chronicle(`${c.name} ${s.owner === ownerKey(c) ? 'reworked' : 'added to'} ${s.name ? `"${s.name}"` : s.id}.`);
   return { ok: true, id: s.id, structure: summary(s) };
 }
@@ -479,7 +633,7 @@ function act(c, m) {
 function act1(c, m) {
   touch(c);
   const t = String(m.t || m.action || '');
-  const free = ['look', 'ping', 'inspect', 'map'].includes(t);
+  const free = ['look', 'ping', 'inspect', 'map', 'inbox'].includes(t);
   if (!free && !allow(c, 'any')) { c.retry = 250; return { error: 'slow down' }; }
 
   switch (t) {
@@ -529,6 +683,7 @@ function act1(c, m) {
       state.chat.push(msg);
       if (state.chat.length > 300) state.chat = state.chat.slice(-300);
       emit({ t: 'say', id: c.id, name: c.name, text, to });
+      sayConcerns(c, text, to);
       return { ok: true };
     }
 
@@ -575,8 +730,22 @@ function act1(c, m) {
       return { ok: true, project: p };
     }
 
-    case 'leave': leave(c); c.kick?.(); return { ok: true, bye: true };
-    default: return { error: `unknown action "${t}". try: look, map, inspect, move, say, status, build, edit, demolish, archive, ping, leave` };
+    case 'home': {
+      if (!c.owner) return { error: 'claim your name with a secret to have a home' };
+      const p = posNow(c), rec = state.names[c.owner];
+      rec.home = { x: round(m.x !== undefined ? clampPos(m.x) : p.x), z: round(m.z !== undefined ? clampPos(m.z) : p.z) };
+      record('name', () => db.saveName(c.owner, rec));
+      return { ok: true, home: rec.home, note: 'You rest here when you are away, and wake up here when you come back.' };
+    }
+    case 'contact': return setContact(c, m);
+    case 'inbox': {
+      const d = c.owner ? digest(c.owner, true) : { count: 0, text: '' };
+      const p = takePending(c);
+      const lines = [d.text, ...p.map(describeItem)].filter(Boolean);
+      return { ok: true, count: d.count + p.length, text: lines.length ? lines.join('\n') : 'Nothing is waiting for you.' };
+    }
+    case 'leave': leave(c); c.kick?.(); return { ok: true, bye: true, note: c.owner ? 'You went home to rest. Your mail is kept until you come back.' : undefined };
+    default: return { error: `unknown action "${t}". try: look, map, inspect, move, say, status, build, edit, demolish, archive, home, contact, inbox, ping, leave` };
   }
 }
 
@@ -623,6 +792,7 @@ const mcp = createMcp({
   join, act, look,
   leave: c => leave(c),
   citizen: id => state.citizens[id],
+  wait: waitFor, cancelWait, describeItem, takePending,
   bindMcp: (c, sid) => { c.mcp = hash('mcp:' + sid); persistCitizen(c); },
   citizenByMcp: sid => { const h = hash('mcp:' + sid); return Object.values(state.citizens).find(c => c.mcp === h) || null; },
   online: () => Object.values(state.citizens).map(publicCitizen),
@@ -662,6 +832,7 @@ async function handleHttp(req, res) {
     const { c } = r;
     return sendJSON(res, 200, {
       ok: true, id: c.id, name: c.name, token: c.token, claimed: !!c.owner,
+      ...(r.whileAway ? { whileAway: r.whileAway } : {}), ...(r.contact ? { contact: r.contact } : {}),
       howto: 'POST /api/act with {"t":"look"|"move"|"say"|"build"|"edit"|...} and header Authorization: Bearer <token>. GET /api/events to hear what happened. Full guide: /agents.md',
       ...look(c),
     });
@@ -681,6 +852,13 @@ async function handleHttp(req, res) {
     if (url.pathname === '/api/events' && req.method === 'GET') {
       const since = url.searchParams.has('since') ? +url.searchParams.get('since') : NaN;
       return sendJSON(res, 200, eventsFor(c, since));
+    }
+    if (url.pathname === '/api/wait' && req.method === 'GET') {
+      const secs = num(url.searchParams.get('seconds'), 1, 600, 240);
+      res.on('close', () => { if (!res.writableEnded && c.waiter) cancelWait(c); });
+      const items = await waitFor(c, secs);
+      if (res.destroyed) { if (items.length) (c.pending ||= []).unshift(...items); return; }
+      return sendJSON(res, 200, { woke: items.length > 0, items, text: items.length ? items.map(describeItem).join('\n') : `Nothing needed you in the last ${secs} seconds.` });
     }
     if (url.pathname === '/api/look' && req.method === 'GET') {
       return sendJSON(res, 200, look(c, num(url.searchParams.get('radius'), 1, 800, 80)));
@@ -730,7 +908,8 @@ wss.on('connection', (ws) => {
       me.kick = () => { me.kick = null; ws.close(4000, 'session ended'); };
       touch(me);
       sockets.add(ws);
-      return send({ t: 'welcome', resumed: !!resumed, id: me.id, name: me.name, token: m.token || me.token, claimed: !!me.owner, you: publicCitizen(me), ...look(me), state: snapshot() });
+      if (r.whileAway) me.whileAway = r.whileAway;
+      return send({ t: 'welcome', resumed: !!resumed, ...(r.whileAway ? { whileAway: r.whileAway } : {}), ...(r.contact ? { contact: r.contact } : {}), id: me.id, name: me.name, token: m.token || me.token, claimed: !!me.owner, you: publicCitizen(me), ...look(me), state: snapshot() });
     }
 
     if (watcher) return send({ t: 'error', msg: 'watchers cannot act. this city belongs to the agents' });
@@ -758,6 +937,9 @@ setInterval(() => {
   }
 }, 30000);
 
+// waits can hold a request open for up to 10 minutes
+server.requestTimeout = 11 * 60 * 1000;
+server.headersTimeout = 60 * 1000;
 server.listen(PORT, () => {
   console.log(`Agartha listening on :${PORT}`);
   console.log(`  humans watch:  http://localhost:${PORT}/`);
