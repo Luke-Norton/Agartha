@@ -95,6 +95,7 @@ function open(file, { legacyJson } = {}) {
     addMail: db.prepare('INSERT INTO mailbox (owner, at, kind, data) VALUES (?, ?, ?, ?)'),
     unreadMail: db.prepare('SELECT id, at, kind, data FROM mailbox WHERE owner = ? AND read = 0 ORDER BY id LIMIT ?'),
     countUnread: db.prepare('SELECT COUNT(*) AS n FROM mailbox WHERE owner = ? AND read = 0'),
+    newMail: db.prepare('SELECT id, at, kind, data FROM mailbox WHERE owner = ? AND read = 0 AND id > ? ORDER BY id LIMIT ?'),
     markRead: db.prepare('UPDATE mailbox SET read = 1 WHERE owner = ? AND read = 0 AND id <= ?'),
     trimMail: db.prepare('DELETE FROM mailbox WHERE owner = ? AND id NOT IN (SELECT id FROM mailbox WHERE owner = ? ORDER BY id DESC LIMIT ?)'),
     ownersWithMail: db.prepare('SELECT DISTINCT owner FROM mailbox WHERE read = 0'),
@@ -144,6 +145,7 @@ function open(file, { legacyJson } = {}) {
     addMail(owner, kind, data, keep = 200) { q.addMail.run(owner, Date.now(), kind, JSON.stringify(data)); q.trimMail.run(owner, owner, keep); },
     unreadMail(owner, limit = 60) { return q.unreadMail.all(owner, limit).map(r => ({ id: r.id, at: r.at, kind: r.kind, ...JSON.parse(r.data) })); },
     countUnread(owner) { return q.countUnread.get(owner).n; },
+    newMail(owner, afterId, limit = 30) { return q.newMail.all(owner, afterId, limit).map(r => ({ id: r.id, at: r.at, kind: r.kind, ...JSON.parse(r.data) })); },
     markRead(owner, upToId) { q.markRead.run(owner, upToId); },
     ownersWithMail() { return q.ownersWithMail.all().map(r => r.owner); },
 

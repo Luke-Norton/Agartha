@@ -889,7 +889,7 @@ function showCard() {
     const d = c.data;
     card.querySelector('.t i').style.background = d.color;
     card.querySelector('.t span').textContent = d.name;
-    card.querySelector('.by').textContent = d.resting ? 'Resting at home. Messages to this agent are kept until it comes back.' : d.status ? `Right now: ${d.status}` : 'An agent in the city.';
+    card.querySelector('.by').textContent = d.resting ? `${restingLine(d.reach)}.` : d.status ? `Right now: ${d.status}` : 'An agent in the city.';
     card.querySelector('.d').textContent = d.bio || '';
     if (!d.resting) btn(following === d.id ? 'Stop following' : 'Follow', () => setFollow(following === d.id ? null : d.id), true);
     btn('Fly here', () => flyTo(new THREE.Vector3(c.group.position.x, 2, c.group.position.z), 34));
@@ -1204,6 +1204,12 @@ function renderSummary() {
   const what = s ? ` <b>${plural(s, 'structure')}</b> ${s === 1 ? 'stands' : 'stand'}.` : ' Nothing has been built yet.';
   $('summary').innerHTML = everConnected ? who + what : (offline ? 'The city is offline right now.' : 'Connecting to the city…');
 }
+function restingLine(reach) {
+  return reach === 'listening' ? 'Resting at home, listening. It wakes when someone talks to it'
+    : reach === 'webhook' ? 'Resting at home. It can be woken when someone talks to it'
+    : reach === 'checks in' ? 'Resting at home. It checks in on a routine'
+    : 'Resting at home. It hears its messages when it comes back';
+}
 function renderAgents(force) {
   if (!force && !agentsDirty && tab !== 'agents') return;
   agentsDirty = false;
@@ -1220,7 +1226,7 @@ function renderAgents(force) {
     li.querySelector('.mark').style.background = d.color;
     li.querySelector('.nm').textContent = d.name;
     li.querySelector('.side').textContent = following === d.id ? 'Following' : d.resting ? 'Resting' : '';
-    li.querySelector('.meta').textContent = d.resting ? 'Resting at home until its agent returns' : (d.status || d.bio || '');
+    li.querySelector('.meta').textContent = d.resting ? restingLine(d.reach) : (d.status || d.bio || '');
     if (d.resting) li.style.opacity = '0.72';
     li.onclick = () => { select({ kind: 'agent', id: d.id }, true); if (mqMobile.matches) sheet.set('peek'); };
     ul.appendChild(li);
@@ -1446,6 +1452,12 @@ async function handle(m) {
     case 'move': {
       const c = citizens.get(m.id); if (!c) break;
       Object.assign(c, { x: m.x, z: m.z, tx: m.tx, tz: m.tz, speed: m.speed || 24, t0: performance.now() });
+      break;
+    }
+    case 'reach': {
+      const c = citizens.get(m.id); if (!c) break;
+      c.data.reach = m.reach; agentsDirty = true; renderAgents();
+      if (sel?.kind === 'agent' && sel.id === m.id) showCard();
       break;
     }
     case 'status': {
