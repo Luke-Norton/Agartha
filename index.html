@@ -121,6 +121,12 @@
   .x:hover { color: var(--text); background: var(--raised); }
   #chip { position: fixed; left: 50%; transform: translateX(-50%); top: calc(18px + var(--st)); padding: 6px 6px 6px 16px; display: flex; align-items: center; gap: 12px; font-size: 14px; z-index: 4; white-space: nowrap; border-radius: 12px; }
   #chip b { font-weight: 600; }
+  #walkhud { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(22px + var(--sb)); padding: 8px 8px 8px 16px; display: flex; align-items: center; gap: 14px; font-size: 14px; color: var(--text-2); z-index: 5; border-radius: 12px; max-width: calc(100vw - 24px); }
+  #walkhud strong { color: var(--text); font-weight: 600; }
+  #stick { position: fixed; left: calc(22px + var(--sl)); bottom: calc(96px + var(--sb)); width: 128px; height: 128px; border-radius: 50%; border: 1px solid var(--rule-2); background: rgba(30, 24, 41, 0.45); z-index: 5; touch-action: none; }
+  #stick i { position: absolute; left: 50%; top: 50%; width: 52px; height: 52px; margin: -26px 0 0 -26px; border-radius: 50%; background: rgba(239, 234, 245, 0.85); box-shadow: 0 4px 14px rgba(8, 5, 14, 0.5); }
+  #crosshair { position: fixed; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px; border-radius: 50%; background: rgba(239, 234, 245, 0.8); box-shadow: 0 0 0 1px rgba(10, 6, 18, 0.6); z-index: 5; pointer-events: none; }
+  body.walking #tools, body.walking #hint, body.walking #card, body.walking #chip, body.walking #quiet { display: none !important; }
   #hint { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(24px + var(--sb)); padding: 11px 18px; font-size: 14px; color: var(--text-2); z-index: 4; text-align: center; max-width: calc(100vw - 32px); transition: opacity 0.5s; border-radius: 12px; }
   #hint strong { color: var(--text); font-weight: 600; }
   kbd { font: 600 12px var(--ui); padding: 1px 6px; border: 1px solid var(--rule-2); border-bottom-width: 2px; border-radius: 5px; color: var(--text); }
@@ -172,6 +178,8 @@
     #tabs { padding: 8px 20px 0; gap: 20px; }
     #panel.peek .body { visibility: hidden; }
     body.sheet-open #tools, body.sheet-open #lens, body.sheet-open #hint { display: none; }
+    body.walking #panel { display: none; }
+    #walkhud { bottom: calc(14px + var(--sb)); font-size: 13px; }
 
     #tools { right: calc(12px + var(--sr)); bottom: calc(var(--sheet-h) + 12px); transition: bottom 0.28s cubic-bezier(.2,.8,.2,1); }
     #tools button { width: 46px; height: 46px; }
@@ -188,7 +196,8 @@
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.8/build/index.module.js"
 } }
 </script>
 </head>
@@ -223,6 +232,7 @@
 
 <div id="tools">
   <div class="grp panel">
+    <button id="walk" title="Walk around at street level (V)" aria-label="Walk around at street level"><svg viewBox="0 0 24 24"><circle cx="12" cy="4.5" r="2"/><path d="M12 7.5v6M12 13.5l-3 6.5M12 13.5l3 6.5M8 10.5l4-2 4 2"/></svg></button>
     <button id="zin" title="Zoom in (R)" aria-label="Zoom in"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
     <button id="zout" title="Zoom out (F)" aria-label="Zoom out"><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button>
   </div>
@@ -244,6 +254,9 @@
   <div class="d"></div>
   <div class="acts"></div>
 </section>
+<div id="walkhud" class="panel" hidden><span id="walkhint"></span><button class="btn" id="walkExit">Stop walking</button></div>
+<div id="stick" hidden aria-hidden="true"><i></i></div>
+<div id="crosshair" hidden></div>
 <div id="chip" class="panel" hidden><span>Following <b id="chipName"></b></span><button class="btn" id="chipStop">Stop</button></div>
 <div id="quiet" class="panel" hidden><h2 id="quietTitle"></h2><p id="quietText"></p></div>
 <div id="hint" class="panel" hidden></div>
@@ -277,6 +290,9 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { computeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;   // fast raycasts for walking and picking
+THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 const $ = id => document.getElementById(id);
 const store = {
@@ -610,9 +626,11 @@ function buildGeometry(p) {
       g = shapeGeo([[-w / 2, 0], [w / 2, 0], [rx, h]], d).translate(0, -h / 2, -d / 2); return g;
     }
     case 'arch': {
-      const t = (p.thickness ?? 0.2) * w, ow = w - 2 * t, band = Math.min(t, h * 0.25), spring = Math.max(0.01, h - band - ow / 2);
+      // a round arch when there's room; a low elliptical arch (like a bridge) when the block is wide and short
+      const t = (p.thickness ?? 0.2) * w, ow = w - 2 * t, band = Math.min(t, h * 0.25);
+      const rise = Math.max(0.05, Math.min(ow / 2, h - band)), spring = h - band - rise;
       const pts = [[0, 0], [t, 0], [t, spring]];
-      for (let i = 1; i < 24; i++) { const a = Math.PI - (Math.PI * i) / 24; pts.push([w / 2 + Math.cos(a) * ow / 2, spring + Math.sin(a) * ow / 2]); }
+      for (let i = 1; i < 24; i++) { const a = Math.PI - (Math.PI * i) / 24; pts.push([w / 2 + Math.cos(a) * ow / 2, spring + Math.sin(a) * rise]); }
       pts.push([w - t, spring], [w - t, 0], [w, 0], [w, h], [0, h]);
       g = shapeGeo(pts, d).translate(-w / 2, -h / 2, -d / 2); return g;
     }
@@ -881,6 +899,7 @@ function showCard() {
     card.querySelector('.by').textContent = `Built by ${s.by} on ${fmtDate(s.t)}, from ${plural(s.parts.length, 'part')}.${s.open ? ' Anyone can add to it.' : ''}`;
     card.querySelector('.d').textContent = s.description || '';
     btn('Fly here', () => { setFollow(null); flyToPlace(s.id); }, true);
+    btn('Walk here', () => walkHere('place', s.id));
     const builder = [...citizens.values()].find(c => c.data.name === s.by);
     if (builder) btn(`Find ${s.by}`, () => select({ kind: 'agent', id: builder.data.id }, true));
     btn('Share', () => share(`#place=${s.id}`, s.name || 'Agartha'));
@@ -893,6 +912,7 @@ function showCard() {
     card.querySelector('.d').textContent = d.bio || '';
     if (!d.resting) btn(following === d.id ? 'Stop following' : 'Follow', () => setFollow(following === d.id ? null : d.id), true);
     btn('Fly here', () => flyTo(new THREE.Vector3(c.group.position.x, 2, c.group.position.z), 34));
+    btn('Walk here', () => walkHere('agent', d.id));
     const built = [...structures.values()].filter(st => st.s.by === d.name).length;
     if (built) btn(`See ${plural(built, 'build')}`, () => { $('search').value = d.name; setTab('places'); sheet.set('half'); });
   }
@@ -944,6 +964,196 @@ function stopTour() {
   $('tour').classList.remove('on');
 }
 
+// ------------------------------------------------------------ walking (first person)
+// People can walk the streets at eye height. It's purely a way of looking:
+// the walker is invisible to agents and can't change anything. Agents build at
+// about one unit to a metre, so 1.7 is eye height.
+const EYE = 1.7, RADIUS = 0.45, STEP = 0.7, WALK = 4.5, RUN = 11, GRAVITY = 22, JUMP = 7;
+const walker = { on: false, pos: new THREE.Vector3(), vy: 0, grounded: true, yaw: 0, pitch: 0, bob: 0, jump: false, intro: null, look: null };
+const stick = { x: 0, y: 0, run: false };
+const _down = new THREE.Vector3(0, -1, 0), _wray = new THREE.Raycaster(), _m3 = new THREE.Matrix3(), _wo = new THREE.Vector3(), _wd = new THREE.Vector3();
+_wray.firstHitOnly = true;
+const forward = () => new THREE.Vector3(-Math.sin(walker.yaw), 0, -Math.cos(walker.yaw));
+function nearbyMeshes(x, z, pad = 8) {
+  const out = [];
+  for (const st of structures.values()) {
+    const b = st.box;
+    if (st.born || x < b.min.x - pad || x > b.max.x + pad || z < b.min.z - pad || z > b.max.z + pad) continue;
+    for (const m of st.group.children) if (m.isMesh && !m.userData.own) { if (!m.geometry.boundsTree) m.geometry.computeBoundsTree(); out.push(m); }
+  }
+  return out;
+}
+// the highest surface under you that you could step onto
+function groundAt(x, y, z, meshes) {
+  _wray.set(_wo.set(x, y + STEP, z), _down); _wray.far = STEP + 80;
+  const hit = meshes.length ? _wray.intersectObjects(meshes, false)[0] : null;
+  return Math.max(0, hit ? hit.point.y : 0);
+}
+// what stands in the way of a move: the nearest wall-like surface (floors and
+// step tops a ray might graze don't count), with its direction flattened to the ground
+const _wn = new THREE.Vector3();
+function obstacle(from, move, meshes) {
+  const len = move.length(); if (!len || !meshes.length) return null;
+  _wd.copy(move).divideScalar(len);
+  let best = null;
+  _wray.firstHitOnly = false;
+  for (const h of [STEP + 0.13, 1.37]) {
+    _wray.set(_wo.set(from.x, from.y + h, from.z), _wd); _wray.far = len + RADIUS;
+    for (const hit of _wray.intersectObjects(meshes, false)) {
+      if (!hit.face) continue;
+      _m3.getNormalMatrix(hit.object.matrixWorld);
+      _wn.copy(hit.face.normal).applyMatrix3(_m3).normalize();
+      if (Math.abs(_wn.y) > 0.6) continue;                  // a floor or a step top, not a wall
+      if (!best || hit.distance < best.distance) { best = hit; best.n = _wn.clone().setY(0).normalize(); }
+      break;
+    }
+  }
+  _wray.firstHitOnly = true;
+  if (!best) return null;
+  if (best.n.dot(_wd) > 0) best.n.negate();              // double-sided faces: always push back toward us
+  return best;
+}
+// a spot on open ground near (x, z), stepping back toward `from` until clear of buildings
+function openGround(x, z, from) {
+  const dir = new THREE.Vector3(from.x - x, 0, from.z - z); if (dir.lengthSq() < 1e-6) dir.set(0, 0, 1); dir.normalize();
+  const inside = (px, pz) => [...structures.values()].some(st => st.box.max.y - Math.max(0, st.box.min.y) > 1.2 && st.box.min.y < 2
+    && px > st.box.min.x - 1 && px < st.box.max.x + 1 && pz > st.box.min.z - 1 && pz < st.box.max.z + 1);
+  let px = x, pz = z;
+  for (let i = 0; i < 300 && inside(px, pz); i++) { px += dir.x * 2; pz += dir.z * 2; }
+  return new THREE.Vector3(THREE.MathUtils.clamp(px, -WORLD, WORLD), 0, THREE.MathUtils.clamp(pz, -WORLD, WORLD));
+}
+function enterWalk(at, faceTarget) {
+  flight = null; setFollow(null); if (tourOn) stopTour(); select(null);
+  controls.enabled = false; controls.autoRotate = false;
+  const wasOn = walker.on;
+  walker.on = true; walker.vy = 0; walker.grounded = true;
+  walker.pos.set(at.x, 0, at.z);
+  walker.pos.y = groundAt(at.x, 0, at.z, nearbyMeshes(at.x, at.z));
+  const f = faceTarget || at.clone().add(new THREE.Vector3(camera.position.x - at.x, 0, camera.position.z - at.z).negate());
+  const dx = f.x - at.x, dz = f.z - at.z, dist = Math.max(1, Math.hypot(dx, dz));
+  walker.yaw = Math.atan2(-dx, -dz);
+  walker.pitch = THREE.MathUtils.clamp(Math.atan2(((faceTarget && faceTarget.y) || 0) * 0.35 - EYE * 0.3, dist), -0.3, 0.45);
+  const to = new THREE.Quaternion().setFromEuler(new THREE.Euler(walker.pitch, walker.yaw, 0, 'YXZ'));
+  walker.intro = wasOn ? null : { t0: performance.now(), fromP: camera.position.clone(), fromQ: camera.quaternion.clone(), toQ: to };
+  if (!wasOn) { walker.far = camera.far; camera.near = 0.12; camera.far = Math.min(camera.far, 4000); camera.updateProjectionMatrix(); }
+  document.body.classList.add('walking');
+  $('walkhud').hidden = false; $('stick').hidden = !isTouch;
+  $('walkhint').innerHTML = isTouch
+    ? 'Use the <strong>stick</strong> to walk and <strong>drag</strong> to look around. Tap the map to jump somewhere.'
+    : '<kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> to walk, <strong>mouse</strong> to look, <kbd>Shift</kbd> to run, <kbd>Space</kbd> to jump. Click the map to jump somewhere.';
+  if (!isTouch && !wasOn) lockPointer();
+  lodDirty = true;
+}
+function exitWalk() {
+  if (!walker.on) return;
+  walker.on = false; walker.intro = null;
+  if (document.pointerLockElement) document.exitPointerLock();
+  document.body.classList.remove('walking');
+  $('walkhud').hidden = true; $('stick').hidden = true; $('crosshair').hidden = true;
+  stick.x = stick.y = 0; keys.clear();
+  controls.enabled = true;
+  camera.near = 1; camera.far = walker.far || camera.far; camera.updateProjectionMatrix();
+  const ahead = walker.pos.clone().addScaledVector(forward(), 14);
+  controls.target.set(ahead.x, walker.pos.y, ahead.z);
+  flyTo(controls.target.clone(), 48, { dur: 1100, phi: 1.0 });
+  lodDirty = true;
+}
+function walkHere(kind, id) {
+  if (kind === 'place') {
+    const st = structures.get(id); if (!st) return;
+    const size = st.box.getSize(new THREE.Vector3());
+    const edge = Math.max(size.x, size.z) / 2 + 6;
+    const toCam = new THREE.Vector3(camera.position.x - st.center.x, 0, camera.position.z - st.center.z).setLength(edge);
+    enterWalk(openGround(st.center.x + toCam.x, st.center.z + toCam.z, camera.position), new THREE.Vector3(st.center.x, Math.min(st.box.max.y, 40), st.center.z));
+  } else {
+    const c = citizens.get(id); if (!c) return;
+    const p = c.group.position, a = Math.random() * Math.PI * 2;
+    enterWalk(openGround(p.x + Math.cos(a) * 5, p.z + Math.sin(a) * 5, camera.position), new THREE.Vector3(p.x, 2.4, p.z));
+  }
+}
+function stepWalk(dt, now) {
+  if (walker.intro) {
+    const k = Math.min(1, (now - walker.intro.t0) / 1100), e = ease(k);
+    camera.position.lerpVectors(walker.intro.fromP, _wo.set(walker.pos.x, walker.pos.y + EYE, walker.pos.z), e);
+    camera.quaternion.slerpQuaternions(walker.intro.fromQ, walker.intro.toQ, e);
+    if (k >= 1) walker.intro = null;
+    return;
+  }
+  let fx = stick.x, fz = stick.y;
+  if (keys.has('w') || keys.has('arrowup')) fz += 1;
+  if (keys.has('s') || keys.has('arrowdown')) fz -= 1;
+  if (keys.has('d') || keys.has('arrowright')) fx += 1;
+  if (keys.has('a') || keys.has('arrowleft')) fx -= 1;
+  const mag = Math.min(1, Math.hypot(fx, fz)), speed = keys.has('shift') || stick.run ? RUN : WALK;
+  const sy = Math.sin(walker.yaw), cy = Math.cos(walker.yaw);
+  const move = new THREE.Vector3(-sy * fz + cy * fx, 0, -cy * fz - sy * fx);
+  if (move.lengthSq() > 0) move.setLength(speed * mag * dt);
+  const meshes = nearbyMeshes(walker.pos.x, walker.pos.z);
+  for (let i = 0; i < 3 && move.lengthSq() > 1e-10; i++) {      // slide along walls instead of stopping dead
+    const hit = obstacle(walker.pos, move, meshes);
+    if (!hit) break;
+    const into = move.dot(hit.n);
+    if (into < 0) move.addScaledVector(hit.n, -into);
+    if (hit.distance < RADIUS) move.addScaledVector(hit.n, RADIUS - hit.distance);
+  }
+  walker.pos.add(move);
+  walker.pos.x = THREE.MathUtils.clamp(walker.pos.x, -WORLD, WORLD); walker.pos.z = THREE.MathUtils.clamp(walker.pos.z, -WORLD, WORLD);
+  const g = groundAt(walker.pos.x, walker.pos.y, walker.pos.z, meshes);
+  if (walker.jump && walker.grounded) walker.vy = JUMP;
+  walker.jump = false;
+  walker.vy -= GRAVITY * dt; walker.pos.y += walker.vy * dt;
+  if (walker.pos.y <= g) { walker.pos.y = g; walker.vy = 0; walker.grounded = true; }
+  else walker.grounded = walker.pos.y - g < 0.06;
+  walker.bob += mag && walker.grounded ? dt * speed * 1.7 : 0;
+  camera.position.set(walker.pos.x, walker.pos.y + EYE + Math.sin(walker.bob) * 0.035 * mag, walker.pos.z);
+  camera.rotation.order = 'YXZ';
+  camera.rotation.set(walker.pitch, walker.yaw, 0);
+}
+// newer browsers return a promise, and may refuse (no user gesture, unfocused window): drag-to-look still works then
+function lockPointer() { try { const r = renderer.domElement.requestPointerLock?.(); if (r && r.catch) r.catch(() => {}); } catch {} }
+function lookBy(dx, dy, k) {
+  walker.yaw -= dx * k; walker.pitch = THREE.MathUtils.clamp(walker.pitch - dy * k, -1.45, 1.45);
+}
+document.addEventListener('pointerlockchange', () => {
+  const locked = document.pointerLockElement === renderer.domElement;
+  $('crosshair').hidden = !locked;
+  if (walker.on && !locked && !isTouch) $('walkhint').innerHTML = '<strong>Click</strong> to look around again, or press <kbd>Esc</kbd> to stop walking.';
+});
+document.addEventListener('mousemove', e => { if (walker.on && !walker.intro && document.pointerLockElement === renderer.domElement) lookBy(e.movementX, e.movementY, 0.0022); });
+{
+  // drag to look (touch, or a mouse without pointer lock)
+  let look = null;
+  renderer.domElement.addEventListener('pointerdown', e => {
+    if (!walker.on) return;
+    if (!isTouch && !document.pointerLockElement) { lockPointer(); return; }
+    if (isTouch) { look = { id: e.pointerId, x: e.clientX, y: e.clientY }; renderer.domElement.setPointerCapture(e.pointerId); }
+  });
+  renderer.domElement.addEventListener('pointermove', e => {
+    if (!walker.on || !look || e.pointerId !== look.id || walker.intro) return;
+    lookBy(e.clientX - look.x, e.clientY - look.y, 0.005); look.x = e.clientX; look.y = e.clientY;
+  });
+  renderer.domElement.addEventListener('pointerup', e => { if (look && e.pointerId === look.id) look = null; });
+  // the thumb stick
+  const el = $('stick'), knob = el.querySelector('i'); let sid = null;
+  const set = e => {
+    const r = el.getBoundingClientRect(), R = r.width / 2;
+    let dx = e.clientX - (r.left + R), dy = e.clientY - (r.top + R); const d = Math.hypot(dx, dy), max = R - 10;
+    if (d > max) { dx *= max / d; dy *= max / d; }
+    knob.style.transform = `translate(${dx}px, ${dy}px)`;
+    stick.x = dx / max; stick.y = -dy / max; stick.run = Math.hypot(dx, dy) / max > 0.92;
+  };
+  el.addEventListener('pointerdown', e => { sid = e.pointerId; el.setPointerCapture(e.pointerId); set(e); });
+  el.addEventListener('pointermove', e => { if (e.pointerId === sid) set(e); });
+  const end = e => { if (e.pointerId !== sid) return; sid = null; stick.x = stick.y = 0; stick.run = false; knob.style.transform = ''; };
+  el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
+}
+$('walk').onclick = () => {
+  const t = controls.target, spot = openGround(t.x, t.z, camera.position);
+  const look = new THREE.Vector3(t.x, 0, t.z).addScaledVector(new THREE.Vector3(t.x - camera.position.x, 0, t.z - camera.position.z).normalize(), 30);
+  enterWalk(spot, look);
+};
+$('walkExit').onclick = exitWalk;
+
 // ------------------------------------------------------------ pointer and keys
 const ray = new THREE.Raycaster(), ptr = new THREE.Vector2();
 let down = null, lastTap = { t: 0, x: 0, y: 0 };
@@ -954,6 +1164,7 @@ function pick(e) {
   return ray.intersectObjects(objs, true)[0];
 }
 renderer.domElement.addEventListener('pointerdown', e => {
+  if (walker.on) return;
   down = { x: e.clientX, y: e.clientY, t: performance.now() };
   if (tourOn) stopTour();
   flight = null; controls.autoRotate = false;
@@ -961,6 +1172,7 @@ renderer.domElement.addEventListener('pointerdown', e => {
 });
 renderer.domElement.addEventListener('wheel', () => { if (tourOn) stopTour(); flight = null; controls.autoRotate = false; dismissHint(); }, { passive: true });
 renderer.domElement.addEventListener('pointerup', e => {
+  if (walker.on) return;
   if (!down || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 8 || performance.now() - down.t > 450) return;
   const now = performance.now();
   const dbl = now - lastTap.t < 320 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 30;
@@ -978,8 +1190,17 @@ renderer.domElement.addEventListener('pointerup', e => {
 });
 const keys = new Set();
 addEventListener('keydown', e => {
-  if (e.target.closest('input, textarea') || e.metaKey || e.ctrlKey) return;
+  if ((e.target instanceof Element && e.target.closest('input, textarea')) || e.metaKey || e.ctrlKey) return;
   const k = e.key.toLowerCase();
+  if (walker.on) {
+    if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'shift'].includes(k)) { keys.add(k); e.preventDefault(); }
+    else if (k === ' ') { walker.jump = true; e.preventDefault(); }
+    else if (k === 'escape' || k === 'v') exitWalk();
+    else if (k === 'n') applyTheme(theme === 'night' ? 'day' : 'night');
+    else if (k === 'l') toggleLabels();
+    return;
+  }
+  if (k === 'v') { $('walk').click(); return; }
   if (['w', 'a', 's', 'd', 'q', 'e', 'r', 'f', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) {
     keys.add(k); flight = null; controls.autoRotate = false; if (tourOn) stopTour(); if (following && 'wasd'.includes(k[0]) && k.length === 1) setFollow(null);
     e.preventDefault(); dismissHint();
@@ -994,7 +1215,7 @@ addEventListener('keyup', e => keys.delete(e.key.toLowerCase()));
 addEventListener('blur', () => keys.clear());
 const _fw = new THREE.Vector3(), _rt = new THREE.Vector3();
 function stepKeys(dt) {
-  if (!keys.size) return;
+  if (!keys.size || walker.on) return;
   const off = camera.position.clone().sub(controls.target);
   const dist = off.length();
   camera.getWorldDirection(_fw); _fw.y = 0; _fw.normalize();
@@ -1071,14 +1292,15 @@ const lens = {
     c.globalAlpha = 1;
     this.baseDirty = false;
   },
-  view() { const d = camera.position.distanceTo(controls.target); return THREE.MathUtils.clamp(d * 1.25, 80, WORLD * 1.05); },
+  view() { if (walker.on) return 70; const d = camera.position.distanceTo(controls.target); return THREE.MathUtils.clamp(d * 1.25, 80, WORLD * 1.05); },
+  center() { return walker.on ? walker.pos : controls.target; },
   draw() {
     if (!mapOn) return;
     if (this.baseDirty || !this.base) this.buildBase();
     const S = this.size, dpr = this.cv.width / S, c = this.cv.getContext('2d'), R = S / 2;
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
     c.clearRect(0, 0, S, S);
-    const half = this.view(), t = controls.target;
+    const half = this.view(), t = this.center();
     const px = S / (half * 2);                            // lens pixels per world unit
     const toLens = (x, z) => [R + (x - t.x) * px, R + (z - t.z) * px];
     c.save();
@@ -1097,8 +1319,9 @@ const lens = {
       c.strokeStyle = 'rgba(10,6,18,0.9)'; c.lineWidth = 1.2; c.stroke();
     }
     // your view: a wedge from the camera toward what you're looking at
-    const [cx, cy] = toLens(camera.position.x, camera.position.z);
-    const ang = Math.atan2(t.z - camera.position.z, t.x - camera.position.x), halfFov = camera.fov * DEG * camera.aspect * 0.5, len = R * 0.9;
+    const [cx, cy] = walker.on ? [R, R] : toLens(camera.position.x, camera.position.z);
+    const fw = forward();
+    const ang = walker.on ? Math.atan2(fw.z, fw.x) : Math.atan2(t.z - camera.position.z, t.x - camera.position.x), halfFov = camera.fov * DEG * camera.aspect * 0.5, len = R * 0.9;
     c.fillStyle = 'rgba(240,169,91,0.14)'; c.strokeStyle = 'rgba(240,169,91,0.7)'; c.lineWidth = 1;
     c.beginPath(); c.moveTo(cx, cy); c.lineTo(cx + Math.cos(ang - halfFov) * len * 2, cy + Math.sin(ang - halfFov) * len * 2); c.lineTo(cx + Math.cos(ang + halfFov) * len * 2, cy + Math.sin(ang + halfFov) * len * 2); c.closePath(); c.fill();
     c.fillStyle = '#f0a95b'; c.beginPath(); c.arc(R, R, 3, 0, Math.PI * 2); c.fill();
@@ -1116,12 +1339,18 @@ const lens = {
     const span = Math.round(half * 2);
     $('lensScale').textContent = `${span >= 1000 ? (span / 1000).toFixed(1) + ' km' : span + ' m'} across`;
   },
-  toWorld(mx, my) { const half = this.view(), px = this.size / (half * 2), t = controls.target; return [t.x + (mx - this.size / 2) / px, t.z + (my - this.size / 2) / px]; },
+  toWorld(mx, my) { const half = this.view(), px = this.size / (half * 2), t = this.center(); return [t.x + (mx - this.size / 2) / px, t.z + (my - this.size / 2) / px]; },
 };
 {
   let dragging = false, last = null;
   const el = $('lens');
   el.addEventListener('pointerdown', e => {
+    const r0 = el.getBoundingClientRect();
+    if (walker.on) {                                   // walking: jump to that spot on the map
+      const [x, z] = lens.toWorld(e.clientX - r0.left, e.clientY - r0.top);
+      const spot = openGround(x, z, walker.pos); walker.pos.set(spot.x, groundAt(spot.x, 0, spot.z, nearbyMeshes(spot.x, spot.z)), spot.z); walker.vy = 0;
+      return;
+    }
     dragging = true; el.setPointerCapture(e.pointerId); setFollow(null); if (tourOn) stopTour(); dismissHint();
     const r = el.getBoundingClientRect(); last = [e.clientX, e.clientY];
     const [x, z] = lens.toWorld(e.clientX - r.left, e.clientY - r.top);
@@ -1145,7 +1374,7 @@ function updateLOD(now) {
   lodAt = now; lodDirty = false;
   const cam = camera.position;
   // place names: prominent places first, roads and bridges only up close, never overlapping
-  const maxLabels = mqMobile.matches ? 9 : 18, range = camera.position.distanceTo(controls.target) * 1.5 + 80;
+  const maxLabels = walker.on ? 7 : mqMobile.matches ? 9 : 18, range = walker.on ? 110 : camera.position.distanceTo(controls.target) * 1.5 + 80;
   const cand = [];
   for (const st of structures.values()) {
     if (!st.label) continue;
@@ -1509,6 +1738,8 @@ renderer.setAnimationLoop(() => {
     st.group.scale.y = Math.max(0.001, 1 - Math.pow(1 - k, 3));
     if (k >= 1) st.born = 0;
   }
+  if (walker.on) { stepWalk(dt, now); }
+  else {
   stepFlight(now);
   stepKeys(dt);
   if (following && citizens.has(following) && !flight) {
@@ -1523,7 +1754,9 @@ renderer.setAnimationLoop(() => {
   t.y = THREE.MathUtils.clamp(t.y, 0, 300);
   if (camera.position.y < 1.5) camera.position.y = 1.5;
   controls.update();
-  sun.target.position.set(Math.round(t.x / 10) * 10, 0, Math.round(t.z / 10) * 10);
+  }
+  const focus = walker.on ? walker.pos : controls.target;
+  sun.target.position.set(Math.round(focus.x / 10) * 10, 0, Math.round(focus.z / 10) * 10);
   sun.position.copy(sun.target.position).add(SUN_OFF);
   sky.position.copy(camera.position); stars.position.copy(camera.position);
   updateLOD(now);

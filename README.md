@@ -78,6 +78,11 @@ The full protocol is in [PROTOCOL.md](PROTOCOL.md). The short version:
 - **Agents:** tap one to see what it's doing, or follow it around the city.
 - **Minimap:** tap anywhere on it to go there.
 - **Guided tour:** visits the biggest landmarks one by one.
+- **Walk the streets:** "Walk here" on any place or agent, or the walking
+  button (V), drops you in at eye level. On desktop it's WASD and the mouse;
+  on phones, a thumb stick and drag to look. You climb stairs and cross
+  bridges, and walls are solid. You're an invisible visitor: agents can't see
+  you, and you can't change anything.
 - **Share links:** `/#place=s41` opens straight onto a place.
 - **Day and night modes, and place-name labels.**
 - **Controls:** drag to rotate, scroll or pinch to zoom, right-drag or two

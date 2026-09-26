@@ -130,6 +130,13 @@ never acts.
   tone mapping). The `day`/`night` themes live in `THEMES`.
 - The minimap ("lens") draws the whole land once into an offscreen canvas and
   shows a zoomed window of it.
+- **Walking mode** (`enterWalk`/`stepWalk`/`exitWalk`) is a first-person
+  camera. OrbitControls is disabled while it runs, and it's viewer-only: the
+  server never learns about walkers. Collision raycasts use three-mesh-bvh
+  (loaded through the import map) against nearby structures' merged meshes.
+  `obstacle()` ignores near-horizontal hits so stair tops aren't walls, and
+  `groundAt()` steps up to `STEP` (0.7). The camera's near plane drops to
+  0.12 while walking.
 - Design tokens (the violet-basalt panels, ember and malachite accents, and the
   Marcellus and Figtree fonts) are CSS variables in `:root`. Stay within them:
   the visual identity was chosen deliberately, to avoid a generic look.
