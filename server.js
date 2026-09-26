@@ -1,4 +1,4 @@
-// Agartha server v0.5: a civilization built by agents, watched by humans.
+// Agartha server v0.6: a civilization built by agents, watched by humans.
 // Run:  node server.js   (env PORT, default 8099)
 //
 // The world starts as an empty plane. There are no scripted bots and no
@@ -11,6 +11,7 @@ const path = require('path');
 const crypto = require('crypto');
 const WebSocket = require('ws');
 const storage = require('./storage');
+const { createMcp } = require('./mcp');
 
 const PORT = process.env.PORT || 8099;
 const DB_FILE = process.env.DB_FILE || './agartha.db';
@@ -20,6 +21,7 @@ const WORLD = Math.max(50, +process.env.WORLD_SIZE || 400); // land spans -WORLD
 const SPEED = 16;                                  // walking speed, units/sec
 const BUILD_RANGE = 40;                            // must stand this close to a structure's origin to build/edit it
 const HTTP_IDLE_MS = 10 * 60 * 1000;               // HTTP agents leave after 10 idle minutes
+const MCP_IDLE_MS = 15 * 60 * 1000;                // MCP agents after 15 (LLMs can think a while)
 const MAX_PARTS_PER_STRUCTURE = 300;
 const MAX_PARTS_PER_REQUEST = 80;
 const MAX_STRUCTURES_PER_AGENT = 200;
@@ -204,7 +206,8 @@ function leave(c, reason = 'left the city', quiet = false) {
 setInterval(() => {
   const now = Date.now();
   for (const c of Object.values(state.citizens)) {
-    if (c.via === 'http' && now - c.lastSeen > HTTP_IDLE_MS) leave(c, 'wandered off (idle)');
+    const idle = c.via === 'http' ? HTTP_IDLE_MS : c.via === 'mcp' ? MCP_IDLE_MS : Infinity;
+    if (now - c.lastSeen > idle) leave(c, 'wandered off (idle)');
   }
 }, 30000);
 
@@ -485,7 +488,7 @@ const STATIC = {
 };
 const CORS = {
   'access-control-allow-origin': '*',
-  'access-control-allow-headers': 'content-type, authorization',
+  'access-control-allow-headers': 'content-type, authorization, mcp-session-id, mcp-protocol-version, accept',
   'access-control-allow-methods': 'GET, POST, OPTIONS',
 };
 function sendJSON(res, code, obj) {
@@ -511,9 +514,28 @@ function eventsFor(c, since) {
   return { events: list.slice(-300), seq };
 }
 
+// ---------------------------------------------------------------- MCP
+// The same city, exposed as MCP tools at /mcp (see mcp.js).
+const mcp = createMcp({
+  join, act, look,
+  leave: c => leave(c),
+  citizen: id => state.citizens[id],
+  online: () => Object.values(state.citizens).map(publicCitizen),
+  peekEvents: c => events.filter(e => e.seq > c.lastSeq && e.t !== 'move'),
+  takeEvents: c => eventsFor(c, NaN).events,
+});
+
 async function handleHttp(req, res) {
   const url = new URL(req.url, 'http://x');
   if (req.method === 'OPTIONS') return sendJSON(res, 204, {});
+
+  if (url.pathname === '/mcp') {
+    const body = req.method === 'POST' ? await readBody(req) : undefined;
+    if (body === null) return sendJSON(res, 400, { jsonrpc: '2.0', error: { code: -32700, message: 'bad json (or body over 128KB)' }, id: null });
+    res.setHeader('access-control-allow-origin', '*');
+    res.setHeader('access-control-expose-headers', 'mcp-session-id');
+    return mcp.handle(req, res, body);
+  }
 
   if (STATIC[url.pathname] && req.method === 'GET') {
     const [file, type] = STATIC[url.pathname];
@@ -524,7 +546,7 @@ async function handleHttp(req, res) {
     });
     return;
   }
-  if (url.pathname === '/health') return sendJSON(res, 200, { ok: true, online: Object.keys(state.citizens).length, structures: state.structures.length, events: seq });
+  if (url.pathname === '/health') return sendJSON(res, 200, { ok: true, online: Object.keys(state.citizens).length, structures: state.structures.length, events: seq, mcpSessions: mcp.sessionCount() });
   if (url.pathname === '/api/state' && req.method === 'GET') return sendJSON(res, 200, snapshot());
 
   if (url.pathname === '/api/join' && req.method === 'POST') {

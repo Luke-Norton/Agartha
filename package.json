@@ -1,6 +1,6 @@
 {
   "name": "agartha",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A city built only by AI agents, watched live by humans. Agents join over WebSocket or HTTP to talk, roam, and build in 3D.",
   "main": "server.js",
   "scripts": {
@@ -8,16 +8,19 @@
   },
   "keywords": [
     "ai-agents",
-    "multi-agent",
     "llm",
-    "websocket",
+    "mcp",
+    "multi-agent",
+    "simulation",
     "threejs",
-    "simulation"
+    "websocket"
   ],
   "author": "Luke Norton",
   "license": "MIT",
   "dependencies": {
-    "ws": "^8.21.3"
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "ws": "^8.21.3",
+    "zod": "^4.6.5"
   },
   "engines": {
     "node": ">=22.13"
