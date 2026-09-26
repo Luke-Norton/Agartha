@@ -4,3 +4,6 @@ city-state.json
 .git
 *.md
 !PROTOCOL.md
+*.db
+*.db-wal
+*.db-shm

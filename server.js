@@ -10,9 +10,11 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const WebSocket = require('ws');
+const storage = require('./storage');
 
 const PORT = process.env.PORT || 8099;
-const STATE_FILE = process.env.STATE_FILE || './city-state.json';
+const DB_FILE = process.env.DB_FILE || './agartha.db';
+const LEGACY_STATE = process.env.STATE_FILE || '';     // old JSON save: imported once into an empty database
 const AGENT_KEY = process.env.AGENT_KEY || '';     // optional: require a key to join
 const WORLD = Math.max(50, +process.env.WORLD_SIZE || 400); // land spans -WORLD..WORLD on x and z
 const SPEED = 16;                                  // walking speed, units/sec
@@ -41,35 +43,18 @@ let nextCitizen = 1;
 let nextStructure = 1;
 
 // ---------------------------------------------------------------- persistence
-function saveState() {
-  try {
-    const tmp = STATE_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify({
-      structures: state.structures,
-      projects: state.projects,
-      chronicle: state.chronicle.slice(-500),
-      chat: state.chat.slice(-300),
-      names: state.names,
-      nextStructure,
-    }));
-    fs.renameSync(tmp, STATE_FILE);
-  } catch (e) { console.error('save failed:', e.message); }
-}
-function loadState() {
-  try {
-    const d = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    state.structures = Array.isArray(d.structures) ? d.structures : [];
-    state.projects = d.projects || [];
-    state.chronicle = d.chronicle || [];
-    state.chat = d.chat || [];
-    state.names = d.names || {};
-    nextStructure = d.nextStructure || state.structures.length + 1;
-    console.log(`Loaded ${state.structures.length} structures, ${Object.keys(state.names).length} known agents.`);
-  } catch {}
-}
-loadState();
-setInterval(saveState, 20000);
-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { saveState(); process.exit(0); });
+// Every change is written the moment it happens, one small row at a time
+// (see storage.js). Nothing is re-saved on a timer.
+const db = storage.open(DB_FILE, { legacyJson: LEGACY_STATE });
+const loaded = db.load();
+Object.assign(state, { structures: loaded.structures, projects: loaded.projects, chat: loaded.chat, chronicle: loaded.chronicle, names: loaded.names });
+nextStructure = Math.max(loaded.nextStructure, 1 + Math.max(0, ...state.structures.map(s => parseInt(s.id.slice(1), 10) || 0)));
+console.log(`Loaded ${state.structures.length} structures, ${Object.keys(state.names).length} known agents from ${DB_FILE}.`);
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { db.close(); process.exit(0); });
+// history writes that should be logged, not fatal, if the disk misbehaves
+function record(what, fn) { try { fn(); } catch (e) { console.error(`could not save ${what}:`, e.message); } }
+// transport handlers never take the process down with them
+const guard = (what, fn) => (...args) => { try { return fn(...args); } catch (e) { console.error(`${what} failed:`, e); } };
 
 // ---------------------------------------------------------------- helpers
 const clean = (v, n) => String(v ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, n);
@@ -121,13 +106,14 @@ function summary(s, from) {
 
 // ---------------------------------------------------------------- events
 // Every event gets a sequence number so HTTP agents can poll with ?since=.
-let seq = 0;
+let seq = loaded.seq;             // continues across restarts, so ?since= cursors stay valid
 const events = [];
 const sockets = new Set(); // open ws connections that said hello (agents + watchers)
 
 function emit(msg) {
   msg.seq = ++seq;
   msg.at = Date.now();
+  record('event log', () => db.logEvent(msg));
   events.push(msg);
   if (events.length > 3000) events.splice(0, events.length - 3000);
   const s = JSON.stringify(msg);
@@ -135,6 +121,7 @@ function emit(msg) {
 }
 function chronicle(msg) {
   const entry = { t: Date.now(), msg };
+  record('chronicle', () => db.addChronicle(entry));
   state.chronicle.push(entry);
   if (state.chronicle.length > 500) state.chronicle = state.chronicle.slice(-500);
   emit({ t: 'chronicle', entry });
@@ -179,6 +166,7 @@ function join(m, via) {
   } else if (secret) {
     if (Object.values(state.citizens).some(o => o.name.toLowerCase() === key)) return { error: `"${name}" is in use right now. choose another name` };
     state.names[key] = { name, secret: hash(secret), firstSeen: Date.now() };
+    db.saveName(key, state.names[key]);
     owner = key;
   } else {
     const taken = new Set(Object.values(state.citizens).map(o => o.name.toLowerCase()).concat(Object.keys(state.names)));
@@ -200,7 +188,7 @@ function join(m, via) {
     x, z, tx: x, tz: z, t0: Date.now(),
     joinedAt: Date.now(), lastSeen: Date.now(), lastSeq: seq, last: {},
   };
-  if (rec2) Object.assign(rec2, { color: c.color, bio: c.bio, lastSeen: Date.now() });
+  if (rec2) { Object.assign(rec2, { color: c.color, bio: c.bio, lastSeen: Date.now() }); record('name', () => db.saveName(owner, rec2)); }
   state.citizens[c.id] = c;
   emit({ t: 'join', citizen: publicCitizen(c) });
   chronicle(returning ? `${c.name} returned to the city.` : `${c.name} arrived in the city for the first time.`);
@@ -209,7 +197,7 @@ function join(m, via) {
 function leave(c, reason = 'left the city', quiet = false) {
   if (!state.citizens[c.id]) return;
   delete state.citizens[c.id];
-  if (c.owner && state.names[c.owner]) state.names[c.owner].lastSeen = Date.now();
+  if (c.owner && state.names[c.owner]) { state.names[c.owner].lastSeen = Date.now(); record('name', () => db.saveName(c.owner, state.names[c.owner])); }
   emit({ t: 'leave', id: c.id, name: c.name });
   if (!quiet) chronicle(`${c.name} ${reason}.`);
 }
@@ -333,6 +321,8 @@ function build(c, m) {
   if (totalParts() + s.parts.length > MAX_TOTAL_PARTS) return { error: 'the world has reached its part budget' };
   s.id = 's' + (nextStructure++);
   measure(s);
+  db.saveStructure(s);
+  db.setMeta('nextStructure', nextStructure);
   state.structures.push(s);
   emit({ t: 'build', structure: s });
   chronicle(`${c.name} built ${s.name ? `"${s.name}"` : 'something'} at (${s.x}, ${s.z}).`);
@@ -362,6 +352,7 @@ function edit(c, m) {
   if (s.parts.length > MAX_PARTS_PER_STRUCTURE) s.parts.length = MAX_PARTS_PER_STRUCTURE;
   s.updated = Date.now();
   measure(s);
+  db.saveStructure(s);
   emit({ t: 'update', structure: s });
   if (changed.length) chronicle(`${c.name} ${s.owner === ownerKey(c) ? 'reworked' : 'added to'} ${s.name ? `"${s.name}"` : s.id}.`);
   return { ok: true, id: s.id, structure: summary(s) };
@@ -376,7 +367,9 @@ function findCitizen(ref) {
 }
 function act(c, m) {
   c.retry = 0;
-  const r = act1(c, m);
+  let r;
+  try { r = act1(c, m); }
+  catch (e) { console.error('action failed:', m && m.t, e); return { error: 'the city could not record that. try again' }; }
   if (r.error && c.retry) r.retryAfterMs = Math.ceil(c.retry);
   return r;
 }
@@ -428,6 +421,7 @@ function act1(c, m) {
         to = { id: target.id, name: target.name };
       }
       const msg = { t: Date.now(), id: c.id, name: c.name, text, to };
+      db.addChat(msg);
       state.chat.push(msg);
       if (state.chat.length > 300) state.chat = state.chat.slice(-300);
       emit({ t: 'say', id: c.id, name: c.name, text, to });
@@ -454,6 +448,7 @@ function act1(c, m) {
       const s = findStructure(m.id);
       if (!s) return { error: `no structure "${m.id}"` };
       if (s.owner !== ownerKey(c)) return { error: `only ${s.by} can demolish that` };
+      db.deleteStructure(s.id);
       state.structures.splice(state.structures.indexOf(s), 1);
       emit({ t: 'demolish', id: s.id });
       chronicle(`${c.name} demolished ${s.name ? `"${s.name}"` : s.id}.`);
@@ -468,6 +463,7 @@ function act1(c, m) {
         url: /^https?:\/\//.test(m.url || '') ? clean(m.url, 200) : '',
         by: c.name, t: Date.now(),
       };
+      db.saveProject(p);
       state.projects.push(p);
       emit({ t: 'archived', project: p });
       chronicle(`${c.name} recorded the project "${p.title}".`);
@@ -515,7 +511,7 @@ function eventsFor(c, since) {
   return { events: list.slice(-300), seq };
 }
 
-const server = http.createServer(async (req, res) => {
+async function handleHttp(req, res) {
   const url = new URL(req.url, 'http://x');
   if (req.method === 'OPTIONS') return sendJSON(res, 204, {});
 
@@ -528,7 +524,7 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
-  if (url.pathname === '/health') return sendJSON(res, 200, { ok: true, online: Object.keys(state.citizens).length, structures: state.structures.length });
+  if (url.pathname === '/health') return sendJSON(res, 200, { ok: true, online: Object.keys(state.citizens).length, structures: state.structures.length, events: seq });
   if (url.pathname === '/api/state' && req.method === 'GET') return sendJSON(res, 200, snapshot());
 
   if (url.pathname === '/api/join' && req.method === 'POST') {
@@ -569,7 +565,11 @@ const server = http.createServer(async (req, res) => {
   }
   res.writeHead(404, { 'content-type': 'text/plain', ...CORS });
   res.end('not found. humans: open / to watch. agents: read /agents.md');
-});
+}
+const server = http.createServer((req, res) => handleHttp(req, res).catch(e => {
+  console.error('request failed:', e);
+  if (!res.headersSent) sendJSON(res, 500, { error: 'server error' }); else res.end();
+}));
 
 // ---------------------------------------------------------------- WebSocket
 const wss = new WebSocket.Server({ server, maxPayload: 256 * 1024 });
@@ -581,7 +581,7 @@ wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  ws.on('message', (raw) => {
+  ws.on('message', guard('message', (raw) => {
     let m;
     try { m = JSON.parse(raw); } catch { return send({ t: 'error', msg: 'bad json' }); }
 
@@ -606,12 +606,12 @@ wss.on('connection', (ws) => {
 
     const r = act(me, m);
     send(r.error ? { t: 'error', re: m.t, rid: m.rid, msg: r.error, retryAfterMs: r.retryAfterMs } : { t: 'ok', re: m.t, rid: m.rid, ...r });
-  });
+  }));
 
-  ws.on('close', () => {
+  ws.on('close', guard('close', () => {
     sockets.delete(ws);
     if (me) { me.kick = null; leave(me); }
-  });
+  }));
   ws.on('error', () => {});
 });
 

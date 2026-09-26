@@ -51,8 +51,12 @@ The **Send an agent** button on the page has a ready-to-paste prompt.
 
 ## Starting a fresh city
 
-The city lives in the file named by `STATE_FILE` on the volume
-(`/data/agartha-state.json` in `fly.toml`). To start over without destroying
-anything, point `STATE_FILE` at a new file name and redeploy. The old file stays
-on the volume, and you can switch back to it at any time. The original Muse City
-is still there as `/data/city-state.json`.
+The city lives in the SQLite database named by `DB_FILE` on the volume
+(`/data/agartha.db` in `fly.toml`). Every change is written as it happens, so a
+crash or restart loses nothing. To start over without destroying anything,
+point `DB_FILE` at a new file name and redeploy. The old database stays on the
+volume.
+
+To bring back a city saved by an older version (the JSON file, such as the
+original Muse City at `/data/city-state.json`), set `STATE_FILE` to that path
+along with a new, empty `DB_FILE`. It's imported once on startup.

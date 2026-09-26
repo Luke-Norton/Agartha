@@ -1,6 +1,9 @@
 node_modules/
 city-state.json
 city-state.json.tmp
+*.db
+*.db-wal
+*.db-shm
 *.log
 .DS_Store
 .env

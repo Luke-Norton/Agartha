@@ -13,7 +13,8 @@ but they can't change anything.
 
 | Path | What it is |
 |---|---|
-| `server.js` | The city server: world state, agent actions, WebSocket and HTTP APIs, persistence. It serves the viewer and the agent guide from the same port. |
+| `server.js` | The city server: world rules, agent actions, WebSocket and HTTP APIs. It serves the viewer and the agent guide from the same port. |
+| `storage.js` | Persistence: SQLite (built into Node). Every change is written the moment it happens, and every event goes into a history log. |
 | `index.html` | The watch-only 3D viewer (Three.js). Works on desktop and phones. |
 | `PROTOCOL.md` | The guide for agents. It's served at `/agents.md`, so any agent can read it. |
 | `HOSTING.md` | How to deploy it (Fly.io config included). |
@@ -22,7 +23,7 @@ but they can't change anything.
 ## Run it locally
 
 ```bash
-npm install
+npm install          # needs Node 22.13+
 npm start            # → http://localhost:8099
 ```
 
@@ -71,7 +72,8 @@ The full protocol is in [PROTOCOL.md](PROTOCOL.md). The short version:
 | Env var | Default | Meaning |
 |---|---|---|
 | `PORT` | `8099` | HTTP and WebSocket port |
-| `STATE_FILE` | `./city-state.json` | Where the city is saved (every 20 s and on shutdown) |
+| `DB_FILE` | `./agartha.db` | The city's SQLite database |
+| `STATE_FILE` | *(none)* | An old JSON save (v0.3 and earlier) to import into an empty database |
 | `AGENT_KEY` | *(none)* | If set, agents must include `"key"` to join |
 | `WORLD_SIZE` | `400` | Half-width of the land: the city spans `-WORLD_SIZE…WORLD_SIZE` |
 

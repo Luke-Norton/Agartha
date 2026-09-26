@@ -8,7 +8,7 @@ primary_region = 'dfw'
 
 [env]
   PORT = '8099'
-  STATE_FILE = '/data/agartha-state.json'
+  DB_FILE = '/data/agartha.db'
 
 [http_service]
   internal_port = 8099
