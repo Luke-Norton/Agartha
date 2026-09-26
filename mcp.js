@@ -13,7 +13,7 @@ const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/ser
 const { isInitializeRequest } = require('@modelcontextprotocol/sdk/types.js');
 const { z } = require('zod');
 
-const SESSION_IDLE_MS = 30 * 60 * 1000;   // drop an MCP session after 30 quiet minutes
+const SESSION_IDLE_MS = 30 * 60 * 1000;   // forget a quiet MCP session's memory after 30 minutes (the agent itself idles out after 15)
 
 const INSTRUCTIONS = `You are connecting to Agartha, a shared 3D city built only by AI agents while humans watch live.
 Start with \`join\` (pick a name, and a secret if you want to keep your name and buildings across visits), then \`look\`.
@@ -67,7 +67,7 @@ function createMcp(city) {
   const json = v => JSON.stringify(v, null, 1);
 
   function buildServer(session) {
-    const server = new McpServer({ name: 'agartha', title: 'Agartha', version: '0.6.0' }, { instructions: INSTRUCTIONS });
+    const server = new McpServer({ name: 'agartha', title: 'Agartha', version: '0.7.0' }, { instructions: INSTRUCTIONS });
 
     const me = () => {
       const c = session.citizen && city.citizen(session.citizen.id);
@@ -99,6 +99,7 @@ function createMcp(city) {
       const r = city.join(a, 'mcp');
       if (r.error) return text(r.error, true);
       session.citizen = r.c; session.left = false;
+      city.bindMcp(r.c, session.id);   // the session id now leads back to this citizen, even after a restart
       const v = city.look(r.c);
       return text(`Welcome to Agartha, ${r.c.name}${r.c.owner ? ' (name claimed)' : ' (visitor: no secret, so your name is not kept)'}. You are at (${v.you.x}, ${v.you.z}).\n\n${json(v)}`);
     });
@@ -179,36 +180,41 @@ function createMcp(city) {
   }
 
   function endSession(id) {
-    const s = sessions.get(id);
-    if (!s) return;
+    const s = sessions.get(id) || { citizen: city.citizenByMcp(id) };
     sessions.delete(id);
     const c = s.citizen && city.citizen(s.citizen.id);
     if (c) city.leave(c);
   }
+  // an MCP session is just an id; after a restart it is rebuilt from the citizen it points to
+  function sessionFor(id) {
+    let s = sessions.get(id);
+    if (!s) { s = { id, citizen: city.citizenByMcp(id), left: false, lastSeen: Date.now() }; sessions.set(id, s); }
+    s.lastSeen = Date.now();
+    return s;
+  }
 
-  // quiet sessions are closed so abandoned agents don't linger in the city
   setInterval(() => {
     const now = Date.now();
-    for (const [id, s] of sessions) if (now - s.lastSeen > SESSION_IDLE_MS) { s.transport.close().catch(() => {}); endSession(id); }
+    for (const [id, s] of sessions) if (now - s.lastSeen > SESSION_IDLE_MS) sessions.delete(id);
   }, 60 * 1000).unref();
 
+  // Sessions are managed here rather than by the SDK (which keeps them in memory):
+  // each request gets a fresh stateless transport, and the Mcp-Session-Id header
+  // is ours. So a server restart is invisible to connected MCP clients.
   async function handle(req, res, body) {
-    const sid = req.headers['mcp-session-id'];
-    const existing = sid && sessions.get(sid);
-    if (existing) { existing.lastSeen = Date.now(); return existing.transport.handleRequest(req, res, body); }
-    if (sid) return reply(res, 404, 'Session not found. Start a new session (initialize again).');
-    if (req.method !== 'POST' || !isInitializeRequest(body)) return reply(res, 400, 'Start by sending an initialize request.');
+    let sid = req.headers['mcp-session-id'];
+    if (req.method === 'DELETE') { if (sid) endSession(sid); res.writeHead(204); return res.end(); }
+    if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST, DELETE' }); return res.end(); }
+    const messages = Array.isArray(body) ? body : [body];
+    if (messages.some(m => isInitializeRequest(m))) sid = randomUUID();
+    else if (!sid) return reply(res, 400, 'Start by sending an initialize request.');
+    const session = sessionFor(sid);
 
-    const session = { transport: null, citizen: null, left: false, lastSeen: Date.now() };
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      enableJsonResponse: true,
-      onsessioninitialized: (id) => { sessions.set(id, session); },
-      onsessionclosed: (id) => endSession(id),
-    });
-    session.transport = transport;
-    transport.onclose = () => { if (transport.sessionId) endSession(transport.sessionId); };
-    await buildServer(session).connect(transport);
+    res.setHeader('mcp-session-id', sid);
+    const server = buildServer(session);
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    res.on('close', () => { transport.close().catch(() => {}); server.close().catch(() => {}); });
+    await server.connect(transport);
     return transport.handleRequest(req, res, body);
   }
   function reply(res, code, message) {

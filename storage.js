@@ -47,6 +47,12 @@ const SCHEMA = `
     type TEXT NOT NULL,
     data TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS sessions (
+    key       TEXT PRIMARY KEY,      -- sha256 of the agent's token (the token itself is never stored)
+    citizen   TEXT NOT NULL,
+    last_seen INTEGER NOT NULL,
+    data      TEXT NOT NULL          -- who they are and where they stand, to restore after a restart
+  );
   CREATE TABLE IF NOT EXISTS meta (
     k TEXT PRIMARY KEY,
     v TEXT NOT NULL
@@ -72,6 +78,11 @@ function open(file, { legacyJson } = {}) {
     allNames: db.prepare('SELECT key, data FROM names'),
     addEvent: db.prepare('INSERT INTO events (seq, at, type, data) VALUES (?, ?, ?, ?)'),
     maxSeq: db.prepare('SELECT COALESCE(MAX(seq), 0) AS n FROM events'),
+    putSession: db.prepare('INSERT OR REPLACE INTO sessions (key, citizen, last_seen, data) VALUES (?, ?, ?, ?)'),
+    delSession: db.prepare('DELETE FROM sessions WHERE key = ?'),
+    liveSessions: db.prepare('SELECT key, last_seen, data FROM sessions WHERE last_seen >= ?'),
+    dropSessions: db.prepare('DELETE FROM sessions WHERE last_seen < ?'),
+    recentEvents: db.prepare('SELECT data FROM (SELECT seq, data FROM events ORDER BY seq DESC LIMIT ?) ORDER BY seq'),
     getMeta: db.prepare('SELECT v FROM meta WHERE k = ?'),
     putMeta: db.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)'),
     countStructures: db.prepare('SELECT COUNT(*) AS n FROM structures'),
@@ -92,6 +103,7 @@ function open(file, { legacyJson } = {}) {
         chronicle: q.recentChronicle.all(chronicle).map(r => ({ t: r.t, msg: r.msg })),
         names,
         nextStructure: Number(q.getMeta.get('nextStructure')?.v || 1),
+        nextCitizen: Number(q.getMeta.get('nextCitizen')?.v || 1),
         seq: q.maxSeq.get().n,
       };
     },
@@ -105,6 +117,13 @@ function open(file, { legacyJson } = {}) {
     saveName(key, rec) { q.putName.run(key, JSON.stringify(rec)); },
     logEvent(e) { q.addEvent.run(e.seq, e.at, e.t, JSON.stringify(e)); },
     setMeta(k, v) { q.putMeta.run(k, String(v)); },
+
+    // --- sessions: agents stay in the city across restarts --------------------
+    saveSession(key, citizenId, lastSeen, data) { q.putSession.run(key, citizenId, lastSeen, JSON.stringify(data)); },
+    deleteSession(key) { q.delSession.run(key); },
+    // sessions active since `since`; older ones are dropped (their agents are long gone)
+    liveSessions(since) { q.dropSessions.run(since); return q.liveSessions.all(since).map(r => ({ key: r.key, lastSeen: r.last_seen, ...JSON.parse(r.data) })); },
+    recentEvents(n) { return q.recentEvents.all(n).map(r => JSON.parse(r.data)); },
 
     stats() { return { structures: q.countStructures.get().n, events: q.countEvents.get().n }; },
     close() { try { db.close(); } catch {} },

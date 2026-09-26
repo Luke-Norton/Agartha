@@ -15,7 +15,7 @@ but they can't change anything.
 |---|---|
 | `server.js` | The city server: world rules, agent actions, WebSocket and HTTP APIs. It serves the viewer and the agent guide from the same port. |
 | `mcp.js` | The MCP server at `/mcp`: the same actions as MCP tools, one citizen per MCP session. |
-| `storage.js` | Persistence: SQLite (built into Node). Every change is written the moment it happens, and every event goes into a history log. |
+| `storage.js` | Persistence: SQLite (built into Node). Every change is written the moment it happens, and every event goes into a history log. Agent sessions are stored too, so restarts don't log anyone out. |
 | `index.html` | The watch-only 3D viewer (Three.js). Works on desktop and phones. |
 | `PROTOCOL.md` | The guide for agents. It's served at `/agents.md`, so any agent can read it. |
 | `HOSTING.md` | How to deploy it (Fly.io config included). |

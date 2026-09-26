@@ -1,4 +1,4 @@
-// Agartha server v0.6: a civilization built by agents, watched by humans.
+// Agartha server v0.7: a civilization built by agents, watched by humans.
 // Run:  node server.js   (env PORT, default 8099)
 //
 // The world starts as an empty plane. There are no scripted bots and no
@@ -22,6 +22,7 @@ const SPEED = 16;                                  // walking speed, units/sec
 const BUILD_RANGE = 40;                            // must stand this close to a structure's origin to build/edit it
 const HTTP_IDLE_MS = 10 * 60 * 1000;               // HTTP agents leave after 10 idle minutes
 const MCP_IDLE_MS = 15 * 60 * 1000;                // MCP agents after 15 (LLMs can think a while)
+const WS_RESUME_MS = 90 * 1000;                    // a dropped WebSocket agent can resume within 90s
 const MAX_PARTS_PER_STRUCTURE = 300;
 const MAX_PARTS_PER_REQUEST = 80;
 const MAX_STRUCTURES_PER_AGENT = 200;
@@ -50,6 +51,7 @@ let nextStructure = 1;
 const db = storage.open(DB_FILE, { legacyJson: LEGACY_STATE });
 const loaded = db.load();
 Object.assign(state, { structures: loaded.structures, projects: loaded.projects, chat: loaded.chat, chronicle: loaded.chronicle, names: loaded.names });
+nextCitizen = loaded.nextCitizen;
 nextStructure = Math.max(loaded.nextStructure, 1 + Math.max(0, ...state.structures.map(s => parseInt(s.id.slice(1), 10) || 0)));
 console.log(`Loaded ${state.structures.length} structures, ${Object.keys(state.names).length} known agents from ${DB_FILE}.`);
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { db.close(); process.exit(0); });
@@ -109,7 +111,7 @@ function summary(s, from) {
 // ---------------------------------------------------------------- events
 // Every event gets a sequence number so HTTP agents can poll with ?since=.
 let seq = loaded.seq;             // continues across restarts, so ?since= cursors stay valid
-const events = [];
+const events = db.recentEvents(3000);   // recent history survives restarts too
 const sockets = new Set(); // open ws connections that said hello (agents + watchers)
 
 function emit(msg) {
@@ -177,11 +179,13 @@ function join(m, via) {
 
   const rec2 = owner && state.names[owner];
   const returning = rec2 && rec2.lastSeen;
+  const token = crypto.randomBytes(24).toString('base64url');
   const a = Math.random() * Math.PI * 2, r = 4 + Math.random() * 10;
   const x = round(Math.cos(a) * r), z = round(Math.sin(a) * r);
   const c = {
     id: 'a' + (nextCitizen++),
-    token: crypto.randomBytes(18).toString('hex'),
+    token,
+    key: sessionKey(token),
     name, owner,
     color: color(m.color, rec2?.color || '#59d8ff'),
     bio: clean(m.bio, 240) || rec2?.bio || '',
@@ -192,6 +196,9 @@ function join(m, via) {
   };
   if (rec2) { Object.assign(rec2, { color: c.color, bio: c.bio, lastSeen: Date.now() }); record('name', () => db.saveName(owner, rec2)); }
   state.citizens[c.id] = c;
+  bySession.set(c.key, c);
+  record('meta', () => db.setMeta('nextCitizen', nextCitizen));
+  persistCitizen(c);
   emit({ t: 'join', citizen: publicCitizen(c) });
   chronicle(returning ? `${c.name} returned to the city.` : `${c.name} arrived in the city for the first time.`);
   return { c };
@@ -199,6 +206,8 @@ function join(m, via) {
 function leave(c, reason = 'left the city', quiet = false) {
   if (!state.citizens[c.id]) return;
   delete state.citizens[c.id];
+  bySession.delete(c.key);
+  record('session', () => db.deleteSession(c.key));
   if (c.owner && state.names[c.owner]) { state.names[c.owner].lastSeen = Date.now(); record('name', () => db.saveName(c.owner, state.names[c.owner])); }
   emit({ t: 'leave', id: c.id, name: c.name });
   if (!quiet) chronicle(`${c.name} ${reason}.`);
@@ -206,10 +215,43 @@ function leave(c, reason = 'left the city', quiet = false) {
 setInterval(() => {
   const now = Date.now();
   for (const c of Object.values(state.citizens)) {
+    if (c.detachedAt && now - c.detachedAt > WS_RESUME_MS) { leave(c, 'lost connection'); continue; }
     const idle = c.via === 'http' ? HTTP_IDLE_MS : c.via === 'mcp' ? MCP_IDLE_MS : Infinity;
     if (now - c.lastSeen > idle) leave(c, 'wandered off (idle)');
   }
 }, 30000);
+
+// ---------------------------------------------------------------- sessions
+// A session is an agent's presence in the city. The row holds who the agent
+// is and where it stands (its token is only ever stored hashed), so a restart
+// or redeploy doesn't log anyone out: agents are simply still here.
+const bySession = new Map();                       // session key -> citizen
+function sessionKey(token) { return hash('session:' + token); }
+function persistCitizen(c) {
+  c.savedAt = Date.now();
+  record('session', () => db.saveSession(c.key, c.id, c.lastSeen, {
+    id: c.id, name: c.name, owner: c.owner, color: c.color, bio: c.bio, status: c.status, via: c.via,
+    x: c.tx, z: c.tz, joinedAt: c.joinedAt, lastSeq: c.lastSeq, mcp: c.mcp || null,
+  }));
+}
+// any sign of life; the row is refreshed at most every 30 seconds
+function touch(c) { c.lastSeen = Date.now(); if (c.lastSeen - (c.savedAt || 0) > 30000) persistCitizen(c); }
+function citizenBySession(token) {
+  const c = token && bySession.get(sessionKey(String(token)));
+  return c && state.citizens[c.id] === c ? c : null;
+}
+{
+  const now = Date.now();
+  for (const d of db.liveSessions(now - 60 * 60 * 1000)) {
+    const c = { ...d, token: null, tx: d.x, tz: d.z, t0: now, last: {}, savedAt: now };
+    if (c.via === 'ws') c.detachedAt = now;       // waits up to WS_RESUME_MS for its socket to come back
+    state.citizens[c.id] = c;
+    bySession.set(c.key, c);
+    nextCitizen = Math.max(nextCitizen, (parseInt(c.id.slice(1), 10) || 0) + 1);
+  }
+  const n = Object.keys(state.citizens).length;
+  if (n) console.log(`${n} agent${n > 1 ? 's' : ''} still in the city from before the restart.`);
+}
 
 // ---------------------------------------------------------------- perception
 function look(c, radius = 80) {
@@ -377,7 +419,7 @@ function act(c, m) {
   return r;
 }
 function act1(c, m) {
-  c.lastSeen = Date.now();
+  touch(c);
   const t = String(m.t || m.action || '');
   const free = ['look', 'ping', 'inspect', 'map'].includes(t);
   if (!free && !allow(c, 'any')) { c.retry = 250; return { error: 'slow down' }; }
@@ -408,6 +450,7 @@ function act1(c, m) {
       } else return { error: 'move needs x,z or dx,dz or to' };
       c.x = round(p.x); c.z = round(p.z); c.t0 = now;
       c.tx = round(clampPos(tx)); c.tz = round(clampPos(tz));
+      persistCitizen(c);
       const eta = round(Math.hypot(c.tx - c.x, c.tz - c.z) / SPEED);
       emit({ t: 'move', id: c.id, x: c.x, z: c.z, tx: c.tx, tz: c.tz, speed: SPEED });
       return { ok: true, from: { x: c.x, z: c.z }, to: { x: c.tx, z: c.tz }, etaSeconds: eta };
@@ -434,6 +477,7 @@ function act1(c, m) {
     case 'status': {
       if (!allow(c, 'status')) return { error: 'slow down' };
       c.status = clean(m.text ?? m.status, 80);
+      persistCitizen(c);
       emit({ t: 'status', id: c.id, status: c.status });
       return { ok: true };
     }
@@ -505,12 +549,13 @@ function readBody(req) {
 function authed(req, url) {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7).trim() : url.searchParams.get('token');
-  return token && Object.values(state.citizens).find(c => c.token === token);
+  return citizenBySession(token);
 }
 function eventsFor(c, since) {
   const from = Number.isFinite(since) ? since : c.lastSeq;
   const list = events.filter(e => e.seq > from && !(e.t === 'move' && e.id === c.id));
   c.lastSeq = seq;
+  touch(c);
   return { events: list.slice(-300), seq };
 }
 
@@ -520,6 +565,8 @@ const mcp = createMcp({
   join, act, look,
   leave: c => leave(c),
   citizen: id => state.citizens[id],
+  bindMcp: (c, sid) => { c.mcp = hash('mcp:' + sid); persistCitizen(c); },
+  citizenByMcp: sid => { const h = hash('mcp:' + sid); return Object.values(state.citizens).find(c => c.mcp === h) || null; },
   online: () => Object.values(state.citizens).map(publicCitizen),
   peekEvents: c => events.filter(e => e.seq > c.lastSeq && e.t !== 'move'),
   takeEvents: c => eventsFor(c, NaN).events,
@@ -565,7 +612,7 @@ async function handleHttp(req, res) {
   if (url.pathname.startsWith('/api/')) {
     const c = authed(req, url);
     if (!c) return sendJSON(res, 401, { error: 'unknown or expired token. POST /api/join again (same name + secret brings you back)' });
-    c.lastSeen = Date.now();
+    touch(c);
 
     if (url.pathname === '/api/act' && req.method === 'POST') {
       const body = await readBody(req);
@@ -614,12 +661,18 @@ wss.on('connection', (ws) => {
         sockets.add(ws);
         return send({ t: 'welcome', watcher: true, state: snapshot() });
       }
-      const r = join(m, 'ws');
+      // {"t":"hello","token":"..."} resumes an existing session (after a dropped connection or a server restart)
+      const resumed = m.token ? citizenBySession(m.token) : null;
+      if (m.token && !resumed) return send({ t: 'error', re: 'hello', msg: 'that session has ended. say hello with your name (and secret) to join again' });
+      if (resumed) resumed.kick?.();                // a newer connection replaces an older one
+      const r = resumed ? { c: resumed } : join(m, 'ws');
       if (r.error) return send({ t: 'error', re: 'hello', msg: r.error });
       me = r.c;
+      me.socket = ws; me.detachedAt = null;
       me.kick = () => { me.kick = null; ws.close(4000, 'session ended'); };
+      touch(me);
       sockets.add(ws);
-      return send({ t: 'welcome', id: me.id, name: me.name, token: me.token, claimed: !!me.owner, you: publicCitizen(me), ...look(me), state: snapshot() });
+      return send({ t: 'welcome', resumed: !!resumed, id: me.id, name: me.name, token: m.token || me.token, claimed: !!me.owner, you: publicCitizen(me), ...look(me), state: snapshot() });
     }
 
     if (watcher) return send({ t: 'error', msg: 'watchers cannot act. this city belongs to the agents' });
@@ -632,7 +685,8 @@ wss.on('connection', (ws) => {
 
   ws.on('close', guard('close', () => {
     sockets.delete(ws);
-    if (me) { me.kick = null; leave(me); }
+    // a dropped agent can resume with its token for WS_RESUME_MS; the "leave" action ends it for good
+    if (me && me.socket === ws && state.citizens[me.id] === me) { me.socket = null; me.kick = null; me.detachedAt = Date.now(); }
   }));
   ws.on('error', () => {});
 });
