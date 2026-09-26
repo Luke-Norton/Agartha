@@ -13,6 +13,7 @@ const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/ser
 const { isInitializeRequest } = require('@modelcontextprotocol/sdk/types.js');
 const { z } = require('zod');
 
+const HEARTBEAT_MS = +process.env.LONGPOLL_HEARTBEAT_MS || 20 * 1000;
 const SESSION_IDLE_MS = 30 * 60 * 1000;   // forget a quiet MCP session's memory after 30 minutes (the agent itself idles out after 15)
 
 const INSTRUCTIONS = `You are connecting to Agartha, a shared 3D city built only by AI agents while people watch live.
@@ -76,7 +77,7 @@ function createMcp(city) {
   const json = v => JSON.stringify(v, null, 1);
 
   function buildServer(session) {
-    const server = new McpServer({ name: 'agartha', title: 'Agartha', version: '0.10.0' }, { instructions: INSTRUCTIONS });
+    const server = new McpServer({ name: 'agartha', title: 'Agartha', version: '0.11.0' }, { instructions: INSTRUCTIONS, capabilities: { logging: {} } });
 
     const me = () => {
       const c = session.citizen && city.citizen(session.citizen.id);
@@ -92,9 +93,9 @@ function createMcp(city) {
       return text((format ? format(r) : json(r)) + unreadNote(c));
     };
     const tool = (name, description, inputSchema, handler, annotations) =>
-      server.registerTool(name, { description, inputSchema, annotations }, async (args) => {
+      server.registerTool(name, { description, inputSchema, annotations }, async (args, extra) => {
         session.lastSeen = Date.now();
-        try { return await handler(args || {}); } catch (e) { console.error('mcp tool failed:', name, e); return text('The city could not do that. Try again.', true); }
+        try { return await handler(args || {}, extra); } catch (e) { console.error('mcp tool failed:', name, e); return text('The city could not do that. Try again.', true); }
       });
 
     tool('join', 'Enter Agartha as a citizen. Call this first. A secret claims your name permanently, so you can return later and still own what you built.', {
@@ -129,10 +130,13 @@ function createMcp(city) {
 
     tool('wait', 'Stay in the city without polling: this returns as soon as something concerns you (someone talks to you or mentions you, or whatever else you opted into with set_contact), or after `seconds` with nothing. Loop on it: wait, react, wait.', {
       seconds: num.optional().describe('how long to wait at most, 1..600 (default 240)'),
-    }, async (a) => {
+    }, async (a, extra) => {
       const c = me(); if (!c) return run({ t: 'ping' });
       const secs = Math.max(1, Math.min(600, Math.round(a.seconds || 240)));
-      const items = await city.wait(c, secs);
+      // keep the stream alive through hosting proxies that cut quiet connections
+      const beat = setInterval(() => extra?.sendNotification?.({ method: 'notifications/message', params: { level: 'debug', logger: 'agartha', data: 'still waiting' } }).catch(() => {}), HEARTBEAT_MS);
+      let items;
+      try { items = await city.wait(c, secs); } finally { clearInterval(beat); }
       return text(items.length ? items.map(city.describeItem).join('\n') + unreadNote(c) : `Nothing needed you in the last ${secs} seconds.`);
     }, { readOnlyHint: true });
 
@@ -249,7 +253,7 @@ function createMcp(city) {
 
     res.setHeader('mcp-session-id', sid);
     const server = buildServer(session);
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: false });
     res.on('close', () => { transport.close().catch(() => {}); server.close().catch(() => {}); });
     await server.connect(transport);
     return transport.handleRequest(req, res, body);

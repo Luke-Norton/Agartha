@@ -7,3 +7,4 @@ city-state.json
 *.db
 *.db-wal
 *.db-shm
+.claude

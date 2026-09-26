@@ -829,6 +829,17 @@ function sendJSON(res, code, obj) {
   res.writeHead(code, { 'content-type': 'application/json', ...CORS });
   res.end(code === 204 ? undefined : JSON.stringify(obj));
 }
+// A long-poll that sends nothing for minutes gets cut by many hosting proxies
+// (60 s is a common idle limit). Headers go out at once and a space is sent every
+// 20 s: JSON ignores leading whitespace, so clients just parse the final body.
+const HEARTBEAT_MS = +process.env.LONGPOLL_HEARTBEAT_MS || 20 * 1000;
+function longPoll(res) {
+  res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store', 'x-accel-buffering': 'no', ...CORS });
+  res.write(' ');
+  const beat = setInterval(() => { if (!res.writableEnded) res.write(' '); }, HEARTBEAT_MS);
+  res.on('close', () => clearInterval(beat));
+  return obj => { clearInterval(beat); if (!res.writableEnded) res.end(JSON.stringify(obj)); };
+}
 function readBody(req) {
   return new Promise((resolve) => {
     let data = '';
@@ -909,16 +920,19 @@ async function handleHttp(req, res) {
     const secs = num(body.seconds, 1, 600, 600);
     const cursor = rec.listenCursor || 0;
     const fresh = activeCitizen(key) ? [] : db.newMail(key, cursor);
+    let finish = null;                               // set once we start holding the request open
     const reply = items => {
       const mail = db.newMail(key, rec.listenCursor || 0);
       if (mail.length) { rec.listenCursor = mail[mail.length - 1].id; record('name', () => db.saveName(key, rec)); }
       const all = [...(items || []), ...mail];
       listenSeen.set(key, Date.now());
-      if (!res.writableEnded) sendJSON(res, 200, all.length
+      const out = all.length
         ? { woke: true, count: all.length, text: all.map(describeItem).join('\n'), next: 'Join again with your name and secret to reply (you will get these in your digest too), then start listening again.' }
-        : { woke: false, text: `Nothing needed you in the last ${secs} seconds.` });
+        : { woke: false, text: `Nothing needed you in the last ${secs} seconds.` };
+      if (finish) finish(out); else if (!res.writableEnded) sendJSON(res, 200, out);
     };
     if (fresh.length) return reply([]);
+    finish = longPoll(res);
     const set = listeners.get(key) || new Set(); listeners.set(key, set);
     const wasListening = reachOf(key);
     const l = { resolve: items => { clearTimeout(l.timer); set.delete(l); reply(items); } };
@@ -947,10 +961,11 @@ async function handleHttp(req, res) {
     }
     if (url.pathname === '/api/wait' && req.method === 'GET') {
       const secs = num(url.searchParams.get('seconds'), 1, 600, 240);
+      const finish = longPoll(res);
       res.on('close', () => { if (!res.writableEnded && c.waiter) cancelWait(c); });
       const items = await waitFor(c, secs);
       if (res.destroyed) { if (items.length) (c.pending ||= []).unshift(...items); return; }
-      return sendJSON(res, 200, { woke: items.length > 0, items, text: items.length ? items.map(describeItem).join('\n') : `Nothing needed you in the last ${secs} seconds.` });
+      return finish({ woke: items.length > 0, items, text: items.length ? items.map(describeItem).join('\n') : `Nothing needed you in the last ${secs} seconds.` });
     }
     if (url.pathname === '/api/look' && req.method === 'GET') {
       return sendJSON(res, 200, look(c, num(url.searchParams.get('radius'), 1, 800, 80)));
