@@ -53,6 +53,16 @@ const SCHEMA = `
     last_seen INTEGER NOT NULL,
     data      TEXT NOT NULL          -- who they are and where they stand, to restore after a restart
   );
+  CREATE TABLE IF NOT EXISTS channels (
+    name TEXT PRIMARY KEY,           -- lowercase, a-z 0-9 and dashes
+    data TEXT NOT NULL               -- {name, about, creator, created, members: [claimed names]}
+  );
+  CREATE TABLE IF NOT EXISTS reads (
+    owner TEXT NOT NULL,             -- who has read (claimed name, lowercase)
+    conv  TEXT NOT NULL,             -- 'public', 'dm:<name>' or 'ch:<channel>'
+    last  INTEGER NOT NULL,          -- last message id they have seen there
+    PRIMARY KEY (owner, conv)
+  );
   CREATE TABLE IF NOT EXISTS mailbox (
     id    INTEGER PRIMARY KEY AUTOINCREMENT,
     owner TEXT NOT NULL,             -- the claimed name it's for (lowercase)
@@ -72,13 +82,34 @@ function open(file, { legacyJson } = {}) {
   const db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;');
   db.exec(SCHEMA);
+  // messages carry their kind so every conversation can be read back (added to older databases in place)
+  const chatCols = new Set(db.prepare('PRAGMA table_info(chat)').all().map(c => c.name));
+  for (const [col, type] of [['kind', "TEXT NOT NULL DEFAULT 'public'"], ['channel', 'TEXT'], ['pair', 'TEXT'], ['speaker', 'TEXT']])
+    if (!chatCols.has(col)) db.exec(`ALTER TABLE chat ADD COLUMN ${col} ${type}`);
+  db.exec('CREATE INDEX IF NOT EXISTS chat_channel ON chat (channel, id); CREATE INDEX IF NOT EXISTS chat_pair ON chat (pair, id); CREATE INDEX IF NOT EXISTS chat_kind ON chat (kind, id);');
 
   const q = {
     putStructure: db.prepare('INSERT INTO structures (id, owner, x, z, updated, data) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, x = excluded.x, z = excluded.z, updated = excluded.updated, data = excluded.data'),
     delStructure: db.prepare('DELETE FROM structures WHERE id = ?'),
     allStructures: db.prepare('SELECT data FROM structures ORDER BY rowid'),
-    addChat: db.prepare('INSERT INTO chat (t, data) VALUES (?, ?)'),
-    recentChat: db.prepare('SELECT data FROM (SELECT id, data FROM chat ORDER BY id DESC LIMIT ?) ORDER BY id'),
+    addChat: db.prepare('INSERT INTO chat (t, data, kind, channel, pair, speaker) VALUES (?, ?, ?, ?, ?, ?)'),
+    histPublic: db.prepare("SELECT id, data FROM chat WHERE kind = 'public' AND id < ? ORDER BY id DESC LIMIT ?"),
+    histChannel: db.prepare("SELECT id, data FROM chat WHERE kind = 'channel' AND channel = ? AND id < ? ORDER BY id DESC LIMIT ?"),
+    histPair: db.prepare("SELECT id, data FROM chat WHERE kind = 'direct' AND pair = ? AND id < ? ORDER BY id DESC LIMIT ?"),
+    lastPublic: db.prepare("SELECT id, data FROM chat WHERE kind = 'public' ORDER BY id DESC LIMIT 1"),
+    lastChannel: db.prepare("SELECT id, data FROM chat WHERE kind = 'channel' AND channel = ? ORDER BY id DESC LIMIT 1"),
+    lastPair: db.prepare("SELECT id, data FROM chat WHERE kind = 'direct' AND pair = ? ORDER BY id DESC LIMIT 1"),
+    unreadPublic: db.prepare("SELECT COUNT(*) AS n FROM chat WHERE kind = 'public' AND id > ? AND IFNULL(speaker, '') != ?"),
+    unreadChannel: db.prepare("SELECT COUNT(*) AS n FROM chat WHERE kind = 'channel' AND channel = ? AND id > ? AND IFNULL(speaker, '') != ?"),
+    unreadPair: db.prepare("SELECT COUNT(*) AS n FROM chat WHERE kind = 'direct' AND pair = ? AND id > ? AND IFNULL(speaker, '') != ?"),
+    pairsOf: db.prepare("SELECT DISTINCT pair FROM chat WHERE kind = 'direct' AND (pair LIKE ? OR pair LIKE ?)"),
+    chatById: db.prepare('SELECT id, data FROM chat WHERE id = ?'),
+    maxChat: db.prepare('SELECT COALESCE(MAX(id), 0) AS n FROM chat'),
+    putChannel: db.prepare('INSERT OR REPLACE INTO channels (name, data) VALUES (?, ?)'),
+    allChannels: db.prepare('SELECT data FROM channels'),
+    getRead: db.prepare('SELECT last FROM reads WHERE owner = ? AND conv = ?'),
+    putRead: db.prepare('INSERT INTO reads (owner, conv, last) VALUES (?, ?, ?) ON CONFLICT(owner, conv) DO UPDATE SET last = MAX(last, excluded.last)'),
+    recentChat: db.prepare('SELECT id, data FROM (SELECT id, data FROM chat ORDER BY id DESC LIMIT ?) ORDER BY id'),
     addChronicle: db.prepare('INSERT INTO chronicle (t, msg) VALUES (?, ?)'),
     recentChronicle: db.prepare('SELECT t, msg FROM (SELECT id, t, msg FROM chronicle ORDER BY id DESC LIMIT ?) ORDER BY id'),
     putProject: db.prepare('INSERT OR REPLACE INTO projects (id, data) VALUES (?, ?)'),
@@ -115,7 +146,8 @@ function open(file, { legacyJson } = {}) {
       return {
         structures: q.allStructures.all().map(r => JSON.parse(r.data)),
         projects: q.allProjects.all().map(r => JSON.parse(r.data)),
-        chat: q.recentChat.all(chat).map(r => JSON.parse(r.data)),
+        chat: q.recentChat.all(chat).map(r => ({ mid: r.id, ...JSON.parse(r.data) })),
+        channels: q.allChannels.all().map(r => JSON.parse(r.data)),
         chronicle: q.recentChronicle.all(chronicle).map(r => ({ t: r.t, msg: r.msg })),
         names,
         nextStructure: Number(q.getMeta.get('nextStructure')?.v || 1),
@@ -127,7 +159,26 @@ function open(file, { legacyJson } = {}) {
     // --- writing (one call per change) -------------------------------------
     saveStructure(s) { q.putStructure.run(s.id, s.owner, s.x, s.z, s.updated || s.t || Date.now(), JSON.stringify(s)); },
     deleteStructure(id) { q.delStructure.run(id); },
-    addChat(m) { q.addChat.run(m.t, JSON.stringify(m)); },
+    // returns the message id; kind is public, direct (pair = "a|b" of lowercase names) or channel
+    addChat(m) { return Number(q.addChat.run(m.t, JSON.stringify(m), m.kind || 'public', m.channel || null, m.pair || null, m.speaker || null).lastInsertRowid); },
+    history({ kind = 'public', channel, pair, before = Infinity, limit = 30 }) {
+      const b = Number.isFinite(before) ? before : Number.MAX_SAFE_INTEGER;
+      const rows = kind === 'channel' ? q.histChannel.all(channel, b, limit) : kind === 'direct' ? q.histPair.all(pair, b, limit) : q.histPublic.all(b, limit);
+      return rows.reverse().map(r => ({ mid: r.id, ...JSON.parse(r.data) }));
+    },
+    lastMessage({ kind = 'public', channel, pair }) {
+      const r = kind === 'channel' ? q.lastChannel.get(channel) : kind === 'direct' ? q.lastPair.get(pair) : q.lastPublic.get();
+      return r ? { mid: r.id, ...JSON.parse(r.data) } : null;
+    },
+    unread({ kind = 'public', channel, pair }, after, me) {
+      return (kind === 'channel' ? q.unreadChannel.get(channel, after, me) : kind === 'direct' ? q.unreadPair.get(pair, after, me) : q.unreadPublic.get(after, me)).n;
+    },
+    pairsOf(name) { return q.pairsOf.all(name + '|%', '%|' + name).map(r => r.pair); },
+    message(id) { const r = q.chatById.get(id); return r ? { mid: r.id, ...JSON.parse(r.data) } : null; },
+    maxMessageId() { return q.maxChat.get().n; },
+    saveChannel(ch) { q.putChannel.run(ch.name, JSON.stringify(ch)); },
+    readMark(owner, conv) { return q.getRead.get(owner, conv)?.last || 0; },
+    setReadMark(owner, conv, last) { q.putRead.run(owner, conv, last); },
     addChronicle(e) { q.addChronicle.run(e.t, e.msg); },
     saveProject(p) { q.putProject.run(p.id, JSON.stringify(p)); },
     saveName(key, rec) { q.putName.run(key, JSON.stringify(rec)); },
