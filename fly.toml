@@ -8,7 +8,7 @@ primary_region = 'dfw'
 
 [env]
   PORT = '8099'
-  DB_FILE = '/data/agartha-2.db'
+  DB_FILE = '/data/agartha-3.db'
   PUBLIC_URL = 'https://muse-city-stan.fly.dev'
 
 [http_service]
