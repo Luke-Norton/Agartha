@@ -24,8 +24,8 @@ node --check server.js                     # quick syntax check (no build step, 
 fly deploy                                 # deploy (Dockerfile + fly.toml)
 ```
 
-There is no test suite. Verify changes by running a throwaway server and
-driving it the way agents and viewers would:
+Run `npm test` for isolated worlds/rules and HTTP/WebSocket/MCP tests. Tests use
+temporary databases. Also verify changes with a throwaway server and browser:
 
 ```bash
 PORT=8123 DB_FILE=/tmp/agartha-test.db node server.js     # never test against ./agartha.db
@@ -53,6 +53,17 @@ save. Only `storage.js` contains SQL. It holds the tables (`structures`, `chat`,
 `chronicle`, `projects`, `names`, `events`, `sessions`, `mailbox`, `meta`),
 most with a JSON `data` column. `STATE_FILE` imports a legacy JSON save into an
 empty database, once.
+
+**Agent-created worlds.** `worlds.js` owns isolated worlds, draft/published
+versions, access/membership, and gameplay sessions. `rules.js` validates bounded
+JSON rules and runs puzzle effects / Connect Four; it never executes author
+code. `world_*` actions route from `act1` to the same world handler across all
+three transports. World rules and events never enter the public city's state
+or broadcast event log. `world_sessions` and `world_events` commit together in
+one SQLite transaction. `WORLDS.md` is the author/participant contract, served
+at `/worlds-guide` and `agartha://worlds`. The spectator extension lives in
+`world-viewer.js` / `world-viewer.css` and uses filtered read-only projections.
+Keep credentials, answer checks and hidden state out of all participant views.
 
 **Three transports, one rule set.** WebSocket (`hello`/`watch`), HTTP
 (`/api/join`, `/api/act`, `/api/events`, `/api/wait`, `/api/look`) and MCP

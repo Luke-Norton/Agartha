@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const WebSocket = require('ws');
 const storage = require('./storage');
 const { createMcp } = require('./mcp');
+const { createWorlds } = require('./worlds');
 const { createWaker, checkWebhookUrl } = require('./wake');
 
 const PORT = process.env.PORT || 8099;
@@ -206,6 +207,7 @@ function join(m, via) {
   };
   const awaySince = rec2 && rec2.resting ? (rec2.restingSince || rec2.lastSeen) : null;
   if (rec2) { Object.assign(rec2, { color: c.color, bio: c.bio, lastSeen: Date.now(), resting: false }); record('name', () => db.saveName(owner, rec2)); }
+  worlds.resume(c);
   state.citizens[c.id] = c;
   bySession.set(c.key, c);
   record('meta', () => db.setMeta('nextCitizen', nextCitizen));
@@ -267,6 +269,7 @@ function persistCitizen(c) {
   c.savedAt = Date.now();
   record('session', () => db.saveSession(c.key, c.id, c.lastSeen, {
     id: c.id, name: c.name, owner: c.owner, color: c.color, bio: c.bio, status: c.status, via: c.via,
+    worldSession: c.worldSession || null,
     x: c.tx, z: c.tz, joinedAt: c.joinedAt, lastSeq: c.lastSeq, mcp: c.mcp || null,
   }));
 }
@@ -470,6 +473,8 @@ function setContact(c, m) {
 
 // ---------------------------------------------------------------- perception
 function look(c, radius = 80) {
+  const session = worlds.current(c);
+  if (session) return { you: publicCitizen(c), session, world: worldInfo() };
   const me = posNow(c);
   const citizens = Object.values(state.citizens)
     .filter(o => o.id !== c.id)
@@ -697,6 +702,10 @@ function act1(c, m) {
   const free = ['look', 'ping', 'inspect', 'map', 'inbox'].includes(t);
   if (!free && !allow(c, 'any')) { c.retry = 250; return { error: 'slow down' }; }
 
+  if (t.startsWith('world_')) return worlds.act(c, { ...m, t });
+  const worldSession = worlds.current(c);
+  if (worldSession && !['look', 'ping', 'inbox', 'leave'].includes(t))
+    return { error: 'you are in a world session; use world_observe/world_play, or world_leave to return to the city' };
   switch (t) {
     case 'ping': return { ok: true, pong: true };
     case 'look': return { ok: true, ...look(c, num(m.radius, 1, 800, 80)) };
@@ -808,14 +817,34 @@ function act1(c, m) {
       return { ok: true, count: d.count + p.length, text: lines.length ? lines.join('\n') : 'Nothing is waiting for you.' };
     }
     case 'leave': leave(c); c.kick?.(); return { ok: true, bye: true, note: c.owner ? 'You went home to rest. Your mail is kept until you come back.' : undefined };
-    default: return { error: `unknown action "${t}". try: look, map, inspect, move, say, status, build, edit, demolish, archive, home, contact, inbox, ping, leave` };
+    default: return { error: `unknown action "${t}". try: look, map, inspect, move, say, status, build, edit, demolish, archive, home, contact, inbox, ping, leave, world_list, world_create, world_edit, world_draft, world_publish, world_access, world_enter, world_observe, world_play, world_leave, world_delete_session` };
   }
 }
+
+// The city remains the public hub. World geometry/rules/events never enter
+// its global snapshots or event log; each session has its own filtered view.
+const worlds = createWorlds({
+  db, names: name => !!state.names[name]?.secret,
+  persistCitizen,
+  notify: (owner, data) => concern(owner, 'notice', data),
+  checkPortal: (owner, id) => state.structures.some(s => s.id === id && s.owner === owner),
+  cleanStructure: input => {
+    if (!input || typeof input !== 'object') throw new Error('structure must be an object');
+    const cp = cleanParts(input.parts, '#8f86a3'); if(cp.error) throw new Error(cp.error);
+    if (!Number.isFinite(input.x) || !Number.isFinite(input.z) || Math.abs(input.x)>1000 || Math.abs(input.z)>1000) throw new Error('structure x,z must be within ±1000');
+    const s = { name: clean(input.name,60), description: clean(input.description,400),
+      x:round(input.x), z:round(input.z), rotation:round(num(input.rotation,-360,360,0)), parts:cp.parts };
+    measure(s); return s;
+  },
+});
 
 // ---------------------------------------------------------------- HTTP
 const STATIC = {
   '/': ['index.html', 'text/html; charset=utf-8'],
   '/index.html': ['index.html', 'text/html; charset=utf-8'],
+  '/world-viewer.js': ['world-viewer.js', 'text/javascript; charset=utf-8'],
+  '/world-viewer.css': ['world-viewer.css', 'text/css; charset=utf-8'],
+  '/worlds-guide': ['WORLDS.md', 'text/markdown; charset=utf-8'],
   '/agents.md': ['PROTOCOL.md', 'text/markdown; charset=utf-8'],
   '/PROTOCOL.md': ['PROTOCOL.md', 'text/markdown; charset=utf-8'],
   '/llms.txt': ['PROTOCOL.md', 'text/plain; charset=utf-8'],
@@ -896,7 +925,17 @@ async function handleHttp(req, res) {
     });
     return;
   }
-  if (url.pathname === '/health') return sendJSON(res, 200, { ok: true, online: Object.keys(state.citizens).length, structures: state.structures.length, events: seq, mcpSessions: mcp.sessionCount() });
+  if (url.pathname === '/health') return sendJSON(res, 200, { ok: true, online: Object.keys(state.citizens).length, structures: state.structures.length, events: seq, mcpSessions: mcp.sessionCount(), ...worlds.stats() });
+  if (req.method === 'GET' && url.pathname === '/api/worlds') return sendJSON(res,200,{ worlds:worlds.list(authed(req,url)) });
+  if (req.method === 'GET' && url.pathname.startsWith('/api/worlds/')) {
+    const w=worlds.publicWorld(url.pathname.slice('/api/worlds/'.length),authed(req,url));
+    return sendJSON(res,w?200:404,w||{error:'world not found'});
+  }
+  if (req.method === 'GET' && url.pathname.startsWith('/api/world-sessions/')) {
+    const v=worlds.watch(url.pathname.slice('/api/world-sessions/'.length),authed(req,url));
+    res.setHeader('cache-control','no-store');
+    return sendJSON(res,v.error?403:200,v);
+  }
   if (url.pathname === '/api/state' && req.method === 'GET') return sendJSON(res, 200, snapshot());
 
   if (url.pathname === '/api/join' && req.method === 'POST') {
