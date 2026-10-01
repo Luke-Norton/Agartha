@@ -33,7 +33,9 @@ test('HTTP, WebSocket, MCP and spectator views share enforced world rules and su
   result=await wsRequest(bob,{t:'world_play',operation:'start',actionId:'start',revision:result.session.revision});assert.equal(result.t,'ok');
   let state=(await httpAct(alice.token,{t:'world_observe'})).session;
   await httpAct(alice.token,{t:'world_play',operation:'interact',object:'cabinet',action:'open',revision:state.revision,actionId:'cabinet'});
-  const bobView=await wsRequest(bob,{t:'world_observe'});assert.equal(bobView.session.inventory[0].id,'key');
+  await httpAct(alice.token,{t:'say',text:'WORLD_ONLY_CHAT_SENTINEL',actionId:'world-chat'});
+  const bobView=await wsRequest(bob,{t:'world_observe'});
+  assert.equal(bobView.session.chat.at(-1).text,'WORLD_ONLY_CHAT_SENTINEL');assert.equal(bobView.session.inventory[0].id,'key');
   const wrong=await wsRequest(bob,{t:'world_play',operation:'move',x:30,z:0,revision:bobView.session.revision,actionId:'bypass'});assert.equal(wrong.t,'error');
   const solved=await wsRequest(bob,{t:'world_play',operation:'interact',object:'lock',action:'unlock',answer:'TRANSPORT_HIDDEN_ANSWER',revision:bobView.session.revision,actionId:'solve'});assert.equal(solved.t,'ok');
   await wsRequest(bob,{t:'world_play',operation:'go',room:'garden',revision:solved.session.revision,actionId:'escape'});
@@ -43,6 +45,8 @@ test('HTTP, WebSocket, MCP and spectator views share enforced world rules and su
   const member=await (await request('/api/world-sessions/'+run,alice.token)).json();assert.equal(member.status,'finished');
   const worldList=await (await request('/api/worlds')).json();assert.equal(worldList.worlds.length,0);
   for(const source of [publicCity,cityEvents,JSON.stringify(watchMessages),JSON.stringify(member),JSON.stringify(bobView)])for(const secret of ['TRANSPORT_HIDDEN_ANSWER','WORLD_PASSWORD_SECRET'])assert(!source.includes(secret));
+  for(const source of [publicCity,cityEvents,JSON.stringify(watchMessages)])assert(!source.includes('WORLD_ONLY_CHAT_SENTINEL'));
+  assert.equal(member.chat.at(-1).text,'WORLD_ONLY_CHAT_SENTINEL');
   assert(!publicCity.includes('Private wall'));assert(!JSON.stringify(watchMessages).includes('Private wall'));
   assert((await httpAct(alice.token,{t:'inspect',id:cityBuilding.id},true)).error);
   const denied=await wsRequest(bob,{t:'world_draft',world});assert.equal(denied.t,'error');

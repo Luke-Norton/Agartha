@@ -165,3 +165,15 @@ test('expired turns can be claimed by an opponent',t=>{
   assert.match(x.act(x.a,{t:'world_play',operation:'game_move',column:0,revision:x.observe(x.a).revision,actionId:'late'}).error,/expired/);
   x.play(x.b,'claim_timeout');assert.equal(x.observe(x.a).outcome.winner,'Bob');
 });
+
+test('world chat is scoped to its session, survives restart, and preserves legacy conversations',t=>{
+  const x=setup(t),w=x.buildWorld();const first=x.ok(x.a,{t:'world_enter',world:w}).session.id;
+  x.ok(x.b,{t:'world_enter',session:first});x.play(x.a,'say',{text:'Only our team can see this session.'});
+  assert.equal(x.observe(x.b).chat[0].text,'Only our team can see this session.');
+  const second=x.ok(x.c,{t:'world_enter',world:w}).session.id;
+  assert.equal(x.observe(x.c).chat.length,0);
+  assert.equal(x.worlds.watch(second,null).chat.length,0);
+  x.reload();assert.equal(x.observe(x.b).chat[0].name,'Alice');
+  const old=x.db.loadWorldSessions().find(s=>s.id===first);delete old.chat;x.db.saveWorldSession(old);x.reload();
+  assert.equal(x.observe(x.b).chat[0].text,'Only our team can see this session.');
+});

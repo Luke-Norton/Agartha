@@ -63,6 +63,13 @@ function createWorlds({ db, cleanStructure, checkPortal, notify, persistCitizen,
     return [...worlds.values()].filter(w => (w.listed && w.versions.length) || isMember(w, c)).map(w => publicWorld(w, c));
   }
   function context(s, p, answer) { return { definition: definition(s), state: s.state, player: p, players: s.players, answer }; }
+  function sessionChat(s) {
+    // Older sessions kept speech only in the mixed event history. Migrate it
+    // lazily, retaining existing conversations without changing their events.
+    return s.chat || s.events.filter(e=>e.type==='say').map(e=>({
+      seq:e.seq,at:e.at,name:e.name,text:e.text.slice(e.name.length+2),
+    }));
+  }
   function publicView(s, c, spectator = false) {
     const d = definition(s), w = readWorld(s.world);
     const p = !spectator && s.players.find(p => p.owner === c?.owner);
@@ -88,6 +95,7 @@ function createWorlds({ db, cleanStructure, checkPortal, notify, persistCitizen,
       board: d.engine === 'connect_four' ? s.state.board : undefined,
       turn: d.turnBased && s.status === 'active' ? s.players[s.state.turn % s.players.length]?.name : null,
       turnDeadline: d.turnSeconds && s.status === 'active' ? s.turnAt + d.turnSeconds * 1000 : null,
+      chat: sessionChat(s).map(m=>({seq:m.seq,at:m.at,name:m.name,text:m.text})),
       events: s.events.map(e => ({ ...e })) };
   }
   function watch(id, c) {
@@ -161,7 +169,7 @@ function createWorlds({ db, cleanStructure, checkPortal, notify, persistCitizen,
         if ([...sessions.values()].filter(s => s.world === w.id).length >= 200) fail('session limit reached; remove finished sessions');
         const d = definitionForWorld(w, m.test);
         s = { id: newId('run_'), world: w.id, version: m.test ? 0 : w.versions.at(-1).number, test: !!m.test,
-          ...(m.test ? { testDefinition: clone(d) } : {}), players: [], state: rules.initialState(d), status: 'lobby', structures: [], discovered: [d.entry], revision: 0, events: [], receipts: [], created: Date.now(), updated: Date.now(), turnAt: Date.now() };
+          ...(m.test ? { testDefinition: clone(d) } : {}), players: [], state: rules.initialState(d), status: 'lobby', structures: [], discovered: [d.entry], revision: 0, events: [], chat: [], receipts: [], created: Date.now(), updated: Date.now(), turnAt: Date.now() };
       }
     }
     const d = definition(s), existing = s.players.find(p => p.owner === o);
@@ -266,6 +274,9 @@ function createWorlds({ db, cleanStructure, checkPortal, notify, persistCitizen,
       s.status = 'active'; s.turnAt = now; text = `${c.name} started the session.`;
     } else if (m.operation === 'say') {
       const message = str(m.text,400); if (!message) fail('say what?'); text = `${c.name}: ${message}`;
+      s.chat=clone(sessionChat(s));
+      s.chat.push({seq:s.revision+1,at:now,name:c.name,text:message});
+      if(s.chat.length>300)s.chat.splice(0,s.chat.length-300);
     } else if (m.operation === 'resign') {
       if (s.status !== 'active' || d.kind !== 'game') fail('resignation is for active competitive games');
       s.state.outcome = { text: `${c.name} resigned.`, winner: s.players.find(other => other.owner !== o && !other.departed)?.owner || null }; s.status = 'finished'; text = s.state.outcome.text;

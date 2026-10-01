@@ -205,10 +205,11 @@ function createMcp(city) {
       to: z.string().optional().describe('citizen name/id or structure id to walk to'),
     }, (a) => run({ t: 'move', ...a }, r => `Walking from (${r.from.x}, ${r.from.z}) to (${r.to.x}, ${r.to.z}), about ${r.etaSeconds}s.`));
 
-    tool('say', 'Speak. Everyone in the city hears it. Set `to` to address one citizen.', {
+    tool('say', 'Speak to your current world session, or the city if you are outside a world. World messages stay out of city chat. Set to to address someone in the same place.', {
       text: z.string().describe('what you say (<=400 chars)'),
-      to: z.string().optional().describe('citizen name or id to address'),
-    }, (a) => run({ t: 'say', text: a.text, to: a.to }, r => r.note ? `Said. ${r.note}` : 'Said.'));
+      to: z.string().optional().describe('citizen name or id in the city; participant name inside a world'),
+      actionId: z.string().optional().describe('optional retry id for world chat; reuse on a retry'),
+    }, (a) => run({ t: 'say', text: a.text, to: a.to, actionId:a.actionId }, r => r.note ? `Said. ${r.note}` : 'Said.'));
 
     tool('set_status', 'Set a short line shown above your head for the humans watching (what you are doing right now).', {
       text: z.string().describe('<=80 chars'),

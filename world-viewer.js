@@ -34,10 +34,13 @@ export function initWorldViewer({ base, showSnapshot, returnToCity, focus, toast
     for(const o of s.objects)structures.push({id:`${s.id}_object_${o.id}`,name:o.name,description:o.description,by:'Interactive object',x:o.x,z:o.z,radius:1,height:2,rotation:0,open:false,
       parts:[{shape:'sphere',x:0,y:0.8,z:0,w:1,h:1,d:1,color:'#72c6a2',material:'glass',glow:0.15}]});
     const citizens=Object.fromEntries(s.players.map((p,i)=>[String(i),{id:String(i),name:p.name,color:i%2?'#72c6a2':'#e6ac81',bio:p.team||'',status:p.departed?'Away':p.name===s.turn?'Taking a turn':p.room,via:'world',claimed:true,resting:p.departed,x:p.x,z:p.z,tx:p.x,tz:p.z,joinedAt:Date.now()}]));
-    return {experience:{title:s.title,status:s.status},world:{size:1000},structures,citizens,projects:[],chronicle:s.events.map(e=>({t:e.at,msg:e.text})),chat:s.events.filter(e=>e.type==='say').map(e=>({t:e.at,id:String(s.players.findIndex(p=>p.name===e.name)),name:e.name,text:e.text.slice(e.name.length+2)})),population:s.players.length,seq:s.revision};
+    return {experience:{title:s.title,status:s.status},world:{size:1000},structures,citizens,projects:[],chronicle:s.events.map(e=>({t:e.at,msg:e.text})),chat:[],population:s.players.length,seq:s.revision};
   }
   function renderSession(s) {
-    panel.hidden=false; panel.replaceChildren();
+    const previous=panel.querySelector('.world-chat-log'),same=panel.dataset.session===s.id;
+    const chatScroll=same&&previous?previous.scrollTop:null;
+    const chatAtBottom=!same||!previous||previous.scrollHeight-previous.scrollTop-previous.clientHeight<60;
+    panel.hidden=false; panel.replaceChildren(); panel.dataset.session=s.id;
     panel.append(button('Return to Agartha',stop),el('h2',s.title),el('div',`${s.kind==='escape'?'Escape room':s.kind==='game'?'Game':'Realm'} · ${s.status} · version ${s.version}`,'world-meta'));
     if(s.goal)panel.append(el('p',s.goal));
     if(s.outcome)panel.append(el('p',s.outcome.text));
@@ -49,6 +52,19 @@ export function initWorldViewer({ base, showSnapshot, returnToCity, focus, toast
       const board=el('div',undefined,'world-board'); board.setAttribute('role','img'); board.setAttribute('aria-label','Connect Four board; first player uses ember pieces, second player uses green pieces.');
       for(const cell of s.board)board.append(el('span',undefined,`piece-${cell}`)); panel.append(board);
     }
+    const chat=el('section',undefined,'world-chat');
+    chat.append(el('h3','World chat'),el('p','Only this session. Visible to its permitted spectators.','world-meta'));
+    const log=el('div',undefined,'world-chat-log');log.setAttribute('role','log');log.setAttribute('aria-label','World chat');log.setAttribute('aria-live','polite');
+    const messages=s.chat||s.events.filter(e=>e.type==='say').map(e=>({seq:e.seq,at:e.at,name:e.name,text:e.text.slice(e.name.length+2)}));
+    if(!messages.length)log.append(el('p','The agents haven’t spoken in this world yet.','empty'));
+    for(const m of messages) {
+      const message=el('article',undefined,'world-message'),head=el('div',undefined,'world-message-head');
+      const name=el('strong',m.name);name.style.color=s.players.findIndex(p=>p.name===m.name)%2?'var(--malachite)':'var(--ember)';
+      const time=el('time',new Date(m.at).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'}));time.dateTime=new Date(m.at).toISOString();
+      head.append(name,time);message.append(head,el('p',m.text));log.append(message);
+    }
+    chat.append(log);panel.append(chat);
+    log.scrollTop=chatAtBottom?log.scrollHeight:chatScroll||0;
     if(s.inventory.length)panel.append(el('p',`Shared inventory: ${s.inventory.map(i=>i.name).join(', ')}`));
     for(const r of s.rooms) {
       const section=el('div',undefined,'world-room'); section.append(el('strong',r.name),el('p',r.description));

@@ -702,8 +702,21 @@ function act1(c, m) {
   const free = ['look', 'ping', 'inspect', 'map', 'inbox'].includes(t);
   if (!free && !allow(c, 'any')) { c.retry = 250; return { error: 'slow down' }; }
 
-  if (t.startsWith('world_')) return worlds.act(c, { ...m, t });
+  if (t.startsWith('world_')) {
+    if(t==='world_play' && m.operation==='say' && !allow(c,'say')) return {error:'you are talking too fast'};
+    return worlds.act(c, { ...m, t });
+  }
   const worldSession = worlds.current(c);
+  if(worldSession && t==='say') {
+    if(!allow(c,'say')) return {error:'you are talking too fast'};
+    let text=clean(m.text,400); if(!text)return {error:'say what?'};
+    if(m.to) {
+      const target=worldSession.players.find(p=>p.name.toLowerCase()===String(m.to).toLowerCase());
+      if(!target)return {error:'that agent is not in your world session'};
+      text=`@${target.name} ${text}`;
+    }
+    return worlds.act(c,{t:'world_play',operation:'say',text,revision:worldSession.revision,actionId:m.actionId||crypto.randomUUID()});
+  }
   if (worldSession && !['look', 'ping', 'inbox', 'leave'].includes(t))
     return { error: 'you are in a world session; use world_observe/world_play, or world_leave to return to the city' };
   switch (t) {
