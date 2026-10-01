@@ -72,6 +72,23 @@ const SCHEMA = `
     read  INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS mailbox_unread ON mailbox (owner, read, id);
+  CREATE TABLE IF NOT EXISTS worlds (
+    id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    data TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS world_sessions (
+    id TEXT PRIMARY KEY,
+    world TEXT NOT NULL REFERENCES worlds(id),
+    data TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS world_sessions_world ON world_sessions(world);
+  CREATE TABLE IF NOT EXISTS world_events (
+    session TEXT NOT NULL REFERENCES world_sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY(session, seq)
+  );
   CREATE TABLE IF NOT EXISTS meta (
     k TEXT PRIMARY KEY,
     v TEXT NOT NULL
@@ -130,6 +147,12 @@ function open(file, { legacyJson } = {}) {
     markRead: db.prepare('UPDATE mailbox SET read = 1 WHERE owner = ? AND read = 0 AND id <= ?'),
     trimMail: db.prepare('DELETE FROM mailbox WHERE owner = ? AND id NOT IN (SELECT id FROM mailbox WHERE owner = ? ORDER BY id DESC LIMIT ?)'),
     ownersWithMail: db.prepare('SELECT DISTINCT owner FROM mailbox WHERE read = 0'),
+    putWorld: db.prepare('INSERT INTO worlds (id,owner,data) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data'),
+    allWorlds: db.prepare('SELECT data FROM worlds ORDER BY rowid'),
+    putWorldSession: db.prepare('INSERT INTO world_sessions (id,world,data) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data'),
+    allWorldSessions: db.prepare('SELECT data FROM world_sessions ORDER BY rowid'),
+    delWorldSession: db.prepare('DELETE FROM world_sessions WHERE id=?'),
+    putWorldEvent: db.prepare('INSERT INTO world_events (session,seq,data) VALUES (?,?,?)'),
     getMeta: db.prepare('SELECT v FROM meta WHERE k = ?'),
     putMeta: db.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)'),
     countStructures: db.prepare('SELECT COUNT(*) AS n FROM structures'),
@@ -155,6 +178,15 @@ function open(file, { legacyJson } = {}) {
         seq: q.maxSeq.get().n,
       };
     },
+
+    loadWorlds() { return q.allWorlds.all().map(r => JSON.parse(r.data)); },
+    loadWorldSessions() { return q.allWorldSessions.all().map(r => JSON.parse(r.data)); },
+    saveWorld(w) { q.putWorld.run(w.id,w.owner,JSON.stringify(w)); },
+    saveWorldSession(s,e) { tx(() => {
+      q.putWorldSession.run(s.id,s.world,JSON.stringify(s));
+      if(e) q.putWorldEvent.run(s.id,e.seq,JSON.stringify(e));
+    }); },
+    deleteWorldSession(id) { q.delWorldSession.run(id); },
 
     // --- writing (one call per change) -------------------------------------
     saveStructure(s) { q.putStructure.run(s.id, s.owner, s.x, s.z, s.updated || s.t || Date.now(), JSON.stringify(s)); },

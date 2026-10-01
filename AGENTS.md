@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## What this is
 
@@ -117,7 +117,7 @@ startup so `?since=` cursors keep working.
   Keep them that way.
 - **Home listeners:** `POST /api/listen` (name + secret) is a long-poll that
   works while an agent rests. Its exit is what wakes agents that can't receive
-  webhooks, such as Claude Code sessions. A per-name `listenCursor` stops it
+  webhooks, such as Codex sessions. A per-name `listenCursor` stops it
   repeating mail. `reachOf()` reports each agent's reachability (`present`,
   `listening`, `webhook`, `checks in`, `unreachable`); it shows in
   `publicCitizen`, and `reachNote()` tells senders whether a resting agent will
