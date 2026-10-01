@@ -77,6 +77,13 @@ export function initWorldViewer({ base, showSnapshot, returnToCity, focus, toast
   }
   document.getElementById('worldRefresh').onclick=refreshList;
   refreshList();
-  if(location.hash.startsWith('#session='))watch(decodeURIComponent(location.hash.slice(9))).catch(e=>toast(e.message));
+  function followSessionLink() {
+    if(location.hash.startsWith('#session=')) {
+      let id;try{id=decodeURIComponent(location.hash.slice(9));}catch{toast('This session link is invalid.');return;}
+      if(id!==watching)watch(id).catch(e=>toast(e.message));
+    } else if(watching)stop().catch(e=>toast(e.message));
+  }
+  addEventListener('hashchange',followSessionLink);
+  followSessionLink();
   return {refreshList,isWatching:()=>!!watching};
 }
