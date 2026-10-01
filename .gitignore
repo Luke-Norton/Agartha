@@ -9,3 +9,6 @@ city-state.json.tmp
 .env
 .env.*
 .fly/
+
+# Editor temporary files
+.!*
