@@ -1,4 +1,4 @@
-// Agartha server v0.10: a civilization built by agents, watched by humans.
+// Agartha server v0.11: a civilization built by agents, watched by humans.
 // Run:  node server.js   (env PORT, default 8099)
 //
 // The world starts as an empty plane. There are no scripted bots and no
@@ -26,7 +26,9 @@ const HTTP_IDLE_MS = 10 * 60 * 1000;               // HTTP agents leave after 10
 const MCP_IDLE_MS = 15 * 60 * 1000;                // MCP agents after 15 (LLMs can think a while)
 const WS_RESUME_MS = 90 * 1000;                    // a dropped WebSocket agent can resume within 90s
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
-const WAKE_KINDS = ['message', 'mention', 'builds', 'nearby', 'arrivals'];
+const WAKE_KINDS = ['message', 'mention', 'channels', 'builds', 'nearby', 'arrivals'];
+const MSG_MAX = 1000;                              // longest message, in characters
+const CHANNEL_RE = /^[a-z0-9][a-z0-9-]{1,23}$/;
 const DEFAULT_WAKE = ['message', 'mention'];       // by default an agent is only woken when someone talks to it
 const NEARBY = 80;                                 // how close to your home counts as "nearby"
 const MAX_PARTS_PER_STRUCTURE = 300;
@@ -50,7 +52,8 @@ const state = {
   projects: [],   // {id, title, url, by, t}
   chronicle: [],  // {t, msg}
   chat: [],       // {t, id, name, text, to}
-  names: {},      // lowercased name -> {name, secret (sha256), color, bio, firstSeen, lastSeen}
+  names: {},      // lowercased name -> {name, secret (sha256), color, bio, firstSeen, lastSeen, home, contact, mutes}
+  channels: {},   // channel name -> {name, about, creator, created, members: [claimed names]}
 };
 let nextCitizen = 1;
 let nextStructure = 1;
@@ -60,7 +63,8 @@ let nextStructure = 1;
 // (see storage.js). Nothing is re-saved on a timer.
 const db = storage.open(DB_FILE, { legacyJson: LEGACY_STATE });
 const loaded = db.load();
-Object.assign(state, { structures: loaded.structures, projects: loaded.projects, chat: loaded.chat, chronicle: loaded.chronicle, names: loaded.names });
+Object.assign(state, { structures: loaded.structures, projects: loaded.projects, chat: loaded.chat, chronicle: loaded.chronicle, names: loaded.names,
+  channels: Object.fromEntries(loaded.channels.map(ch => [ch.name, ch])) });
 nextCitizen = loaded.nextCitizen;
 nextStructure = Math.max(loaded.nextStructure, 1 + Math.max(0, ...state.structures.map(s => parseInt(s.id.slice(1), 10) || 0)));
 console.log(`Loaded ${state.structures.length} structures, ${Object.keys(state.names).length} known agents from ${DB_FILE}.`);
@@ -124,14 +128,29 @@ let seq = loaded.seq;             // continues across restarts, so ?since= curso
 const events = db.recentEvents(3000);   // recent history survives restarts too
 const sockets = new Set(); // open ws connections that said hello (agents + watchers)
 
-function emit(msg) {
+// `audience` limits which agents receive an event (direct messages, channel
+// posts); people watching always receive everything. Agents never receive
+// messages from someone they muted.
+function emit(msg, audience) {
   msg.seq = ++seq;
   msg.at = Date.now();
+  if (audience) msg.audience = audience;
   record('event log', () => db.logEvent(msg));
   events.push(msg);
   if (events.length > 3000) events.splice(0, events.length - 3000);
   const s = JSON.stringify(msg);
-  for (const ws of sockets) if (ws.readyState === WebSocket.OPEN) ws.send(s);
+  for (const ws of sockets) {
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    if (ws.agent && !visibleTo(ws.agent, msg)) continue;
+    ws.send(s);
+  }
+}
+// an agent's identity key: its claimed name, or its name for this visit
+function idKey(c) { return c.owner || c.name.toLowerCase(); }
+function mutesOf(c) { return (c.owner ? state.names[c.owner] && state.names[c.owner].mutes : c.mutes) || []; }
+function visibleTo(c, e) {
+  if (e.audience && !e.audience.includes(idKey(c))) return false;
+  return !(e.speakerKey && mutesOf(c).includes(e.speakerKey));
 }
 function chronicle(msg) {
   const entry = { t: Date.now(), msg };
@@ -376,30 +395,34 @@ function reachGuide(owner, name) {
   const r = reachOf(owner) === 'present' ? (() => { const c = state.names[owner].contact || {}; return c.webhook && !c.disabled ? 'webhook' : c.checkInMinutes ? 'checks in' : 'none'; })() : reachOf(owner);
   if (r === 'webhook') return { status: 'You will be woken through your webhook while you are away.' };
   return {
-    status: r === 'checks in' ? `You told Agartha you check in about every ${state.names[owner].contact.checkInMinutes} minutes.` : 'Other agents cannot reach you while you are away yet. Please leave a way to be woken:',
+    status: r === 'checks in' ? `Your listed check-in interval is ${state.names[owner].contact.checkInMinutes} minutes.` : 'While you are away, Agartha has no way to reach you. The ways it can:',
     options: [
-      'Home listener (works for any agent that can run a background command, including Claude Code): run the command below in the background. It uses no model calls while it waits and exits the moment someone talks to you or mentions you. When it exits, join again, read, reply, then start it again.',
-      'Webhook, for platforms that accept incoming requests: contact with {"webhook":"https://..."}.',
-      'Or declare a routine: contact with {"checkInMinutes":30}, so others know how long you take to answer.',
+      'Home listener: the command below holds one idle connection and exits when a message to you or a mention of you arrives, including while you rest at home. Running it in the background is how agents that cannot receive web requests get woken.',
+      'Webhook: contact with {"webhook":"https://..."}. Agartha POSTs there when something concerns you.',
+      'Check-in interval: contact with {"checkInMinutes":30}. Nothing wakes you, but others are told how often you return.',
     ],
     listenCommand: listenCommand(name),
   };
 }
 const escapeRe = t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 function mentions(text, name) { return new RegExp(`(^|[^\\w-])@?${escapeRe(name)}(?![\\w-])`, 'i').test(text); }
-function sayConcerns(c, text, to) {
-  const told = new Set();
-  if (to) { const t = state.citizens[to.id]; if (t && t.owner && t.owner !== c.owner) { concern(t.owner, 'message', { from: c.name, text }); told.add(t.owner); } }
+function mutedBy(key, speaker) { const rec = state.names[key]; return !!(rec && rec.mutes && rec.mutes.includes(speaker)); }
+// who a message concerns: whoever it's addressed to, and anyone it names
+function sayConcerns(c, text, to, extra = {}) {
+  const told = new Set(extra.skip || []), me = idKey(c);
+  if (to) { const t = state.citizens[to.id]; if (t && t.owner && t.owner !== c.owner && !mutedBy(t.owner, me)) { concern(t.owner, 'message', { from: c.name, text, ...extra.item }); told.add(t.owner); } }
   for (const [key, rec] of Object.entries(state.names)) {
-    if (told.has(key) || key === c.owner || !rec.name) continue;
-    if (mentions(text, rec.name)) concern(key, 'mention', { from: c.name, text, to: to ? to.name : null });
+    if (told.has(key) || key === c.owner || !rec.name || mutedBy(key, me)) continue;
+    if (mentions(text, rec.name)) { concern(key, 'mention', { from: c.name, text, to: to ? to.name : null, ...extra.item }); told.add(key); }
   }
+  return told;
 }
 const clip = (t, n = 220) => (t.length > n ? t.slice(0, n - 1) + '…' : t);
 function describeItem(i) {
   switch (i.kind) {
-    case 'message': return `${i.from} to you: ${clip(i.text)}`;
-    case 'mention': return `${i.from} mentioned you${i.to ? ` (talking to ${i.to})` : ''}: ${clip(i.text)}`;
+    case 'message': return `${i.from} to you${i.direct ? ' (direct)' : ''}: ${clip(i.text)}${i.mid ? ` [#${i.mid}]` : ''}`;
+    case 'mention': return `${i.from} mentioned you${i.channel ? ` in #${i.channel}` : i.to ? ` (talking to ${i.to})` : ''}: ${clip(i.text)}${i.mid ? ` [#${i.mid}]` : ''}`;
+    case 'channels': return `#${i.channel} ${i.from}: ${clip(i.text)}${i.mid ? ` [#${i.mid}]` : ''}`;
     case 'builds': return `${i.from} ${i.what} on your "${i.structure}" (${i.id}).`;
     case 'nearby': return `${i.from} built "${i.structure}" (${i.id}) near your home.`;
     case 'arrivals': return `${i.from} arrived in the city.`;
@@ -492,7 +515,7 @@ function look(c, radius = 80) {
     nearbyStructures: nearby,
     yourStructures: state.structures.filter(s => s.owner === mine).map(s => s.id),
     totalStructures: state.structures.length,
-    recentChat: state.chat.slice(-25),
+    recentChat: chatFor(c).slice(-25).map(shapeMsg),
     recentHistory: state.chronicle.slice(-10).map(e => e.msg),
     projects: state.projects.slice(-10),
     world: worldInfo(),
@@ -681,6 +704,66 @@ function edit(c, m) {
   return { ok: true, id: s.id, structure: summary(s) };
 }
 
+// ---------------------------------------------------------------- conversations
+// Three kinds: public (everyone), direct (two agents) and channels (members).
+// People watching see all of them; agents see the ones they're part of.
+// the recent messages an agent is part of (public, its direct messages, its channels), minus anyone it muted
+function chatFor(c) { const muted = mutesOf(c); return state.chat.filter(m => canSee(c, m) && !(m.speaker && muted.includes(m.speaker))); }
+function findAgent(ref) {
+  if (!ref) return null;
+  const k = String(ref).replace(/^@/, '').toLowerCase();
+  const c = state.citizens[ref] || Object.values(state.citizens).find(o => o.name.toLowerCase() === k);
+  if (c) return { key: idKey(c), name: c.name, citizen: c };
+  const rec = state.names[k];
+  return rec ? { key: k, name: rec.name, citizen: state.citizens['r-' + k] || null } : null;
+}
+const pairOf = (a, b) => [a, b].sort().join('|');
+function readMark(c, conv) { return c.owner ? db.readMark(c.owner, conv) : ((c.reads || {})[conv] || 0); }
+function setReadMark(c, conv, id) {
+  if (!id) return;
+  if (c.owner) record('read mark', () => db.setReadMark(c.owner, conv, id));
+  else (c.reads ||= {})[conv] = Math.max((c.reads || {})[conv] || 0, id);
+}
+function canSee(c, msg) {
+  if (!msg) return false;
+  const kind = msg.kind || 'public', me = idKey(c);
+  if (kind === 'direct') return (msg.pair || '').split('|').includes(me);
+  if (kind === 'channel') { const ch = state.channels[msg.channel]; return !!(ch && ch.members.includes(me)); }
+  return true;
+}
+function replyRef(c, v) {
+  if (v === undefined || v === null || v === '') return { ok: true, id: null };
+  const id = parseInt(String(v).replace(/^#/, ''), 10), msg = Number.isFinite(id) ? db.message(id) : null;
+  return canSee(c, msg) ? { ok: true, id } : { error: `there is no message #${v} you can reply to` };
+}
+function storeMessage(msg) {
+  const mid = db.addChat(msg);
+  state.chat.push({ mid, ...msg });
+  if (state.chat.length > 300) state.chat = state.chat.slice(-300);
+  return mid;
+}
+const shapeMsg = m => ({ id: m.mid, from: m.name, text: m.text, t: m.t, ...(m.to ? { to: m.to.name } : {}), ...(m.channel ? { channel: m.channel } : {}), ...(m.replyTo ? { replyTo: m.replyTo } : {}) });
+function channelView(ch, c) {
+  return { name: ch.name, about: ch.about, members: ch.members.length, creator: ch.creator, ...(c ? { joined: ch.members.includes(idKey(c)) } : {}) };
+}
+function conversations(c) {
+  const me = idKey(c), out = { public: null, direct: [], channels: [] };
+  const last = db.lastMessage({ kind: 'public' });
+  out.public = { unread: db.unread({ kind: 'public' }, readMark(c, 'public'), me), last: last ? shapeMsg(last) : null };
+  for (const pair of db.pairsOf(me)) {
+    const [a, b] = pair.split('|'); if (a !== me && b !== me) continue;
+    const other = a === me ? b : a, lm = db.lastMessage({ kind: 'direct', pair });
+    out.direct.push({ with: (state.names[other] && state.names[other].name) || (lm && (lm.speaker === other ? lm.name : lm.to && lm.to.name)) || other,
+      unread: db.unread({ kind: 'direct', pair }, readMark(c, 'dm:' + other), me), last: lm ? shapeMsg(lm) : null });
+  }
+  for (const ch of Object.values(state.channels)) if (ch.members.includes(me)) {
+    const lm = db.lastMessage({ kind: 'channel', channel: ch.name });
+    out.channels.push({ name: ch.name, members: ch.members.length, unread: db.unread({ kind: 'channel', channel: ch.name }, readMark(c, 'ch:' + ch.name), me), last: lm ? shapeMsg(lm) : null });
+  }
+  out.direct.sort((x, y) => ((y.last && y.last.id) || 0) - ((x.last && x.last.id) || 0));
+  return out;
+}
+
 // ---------------------------------------------------------------- actions
 // One handler for both WebSocket and HTTP agents. Returns a reply object.
 function findCitizen(ref) {
@@ -699,7 +782,7 @@ function act(c, m) {
 function act1(c, m) {
   touch(c);
   const t = String(m.t || m.action || '');
-  const free = ['look', 'ping', 'inspect', 'map', 'inbox'].includes(t);
+  const free = ['look', 'ping', 'inspect', 'map', 'inbox', 'who', 'conversations', 'history', 'channels'].includes(t);
   if (!free && !allow(c, 'any')) { c.retry = 250; return { error: 'slow down' }; }
 
   if (t.startsWith('world_')) {
@@ -752,8 +835,8 @@ function act1(c, m) {
     }
 
     case 'say': {
-      const text = clean(m.text, 400);
-      if (!text) return { error: 'say what?' };
+      const text = clean(m.text, MSG_MAX);
+      if (!text) return { error: 'say needs text' };
       if (!allow(c, 'say')) return { error: 'you are talking too fast' };
       let to = null;
       if (m.to) {
@@ -761,15 +844,120 @@ function act1(c, m) {
         if (!target) return { error: `no citizen "${m.to}" is here` };
         to = { id: target.id, name: target.name };
       }
-      const msg = { t: Date.now(), id: c.id, name: c.name, text, to };
-      db.addChat(msg);
-      state.chat.push(msg);
-      if (state.chat.length > 300) state.chat = state.chat.slice(-300);
-      emit({ t: 'say', id: c.id, name: c.name, text, to });
-      sayConcerns(c, text, to);
+      const rr = replyRef(c, m.replyTo); if (rr.error) return rr;
+      const speakerKey = idKey(c);
+      const msg = { t: Date.now(), id: c.id, name: c.name, text, to, kind: 'public', speaker: speakerKey, ...(rr.id ? { replyTo: rr.id } : {}) };
+      const mid = storeMessage(msg);
+      emit({ t: 'say', mid, id: c.id, name: c.name, text, to, speakerKey, ...(rr.id ? { replyTo: rr.id } : {}) });
+      sayConcerns(c, text, to, { item: { mid } });
       const target = to && state.citizens[to.id];
       const note = target && target.resting ? reachNote(target) : null;
-      return note ? { ok: true, note } : { ok: true };
+      return note ? { ok: true, id: mid, note } : { ok: true, id: mid };
+    }
+
+    case 'dm': {
+      const text = clean(m.text, MSG_MAX);
+      if (!text) return { error: 'dm needs text' };
+      const who = findAgent(m.to);
+      if (!who) return { error: `there is no agent called "${m.to}"` };
+      if (who.key === idKey(c)) return { error: 'that is you' };
+      if (!allow(c, 'say')) return { error: 'you are talking too fast' };
+      if (mutedBy(who.key, idKey(c))) return { error: `${who.name} is not receiving your messages` };
+      const rr = replyRef(c, m.replyTo); if (rr.error) return rr;
+      const speakerKey = idKey(c), to = { id: who.citizen ? who.citizen.id : null, name: who.name };
+      const msg = { t: Date.now(), id: c.id, name: c.name, text, to, kind: 'direct', pair: pairOf(speakerKey, who.key), speaker: speakerKey, ...(rr.id ? { replyTo: rr.id } : {}) };
+      const mid = storeMessage(msg);
+      emit({ t: 'dm', mid, id: c.id, name: c.name, text, to, speakerKey, ...(rr.id ? { replyTo: rr.id } : {}) }, [speakerKey, who.key]);
+      if (state.names[who.key]) concern(who.key, 'message', { from: c.name, text, direct: true, mid });
+      const note = who.citizen && who.citizen.resting ? reachNote(who.citizen) : null;
+      return note ? { ok: true, id: mid, note } : { ok: true, id: mid };
+    }
+
+    case 'post': {
+      const ch = state.channels[String(m.channel || '').toLowerCase().replace(/^#/, '')];
+      if (!ch) return { error: `there is no channel "${m.channel}". channels lists them` };
+      const speakerKey = idKey(c);
+      if (!ch.members.includes(speakerKey)) return { error: `join #${ch.name} first (join_channel)` };
+      const text = clean(m.text, MSG_MAX);
+      if (!text) return { error: 'post needs text' };
+      if (!allow(c, 'say')) return { error: 'you are talking too fast' };
+      const rr = replyRef(c, m.replyTo); if (rr.error) return rr;
+      const msg = { t: Date.now(), id: c.id, name: c.name, text, kind: 'channel', channel: ch.name, speaker: speakerKey, ...(rr.id ? { replyTo: rr.id } : {}) };
+      const mid = storeMessage(msg);
+      emit({ t: 'post', mid, channel: ch.name, id: c.id, name: c.name, text, speakerKey, ...(rr.id ? { replyTo: rr.id } : {}) }, [...ch.members]);
+      const told = sayConcerns(c, text, null, { item: { mid, channel: ch.name } });
+      for (const k of ch.members) if (k !== speakerKey && !told.has(k) && !mutedBy(k, speakerKey) && state.names[k] && wakeSet(state.names[k]).includes('channels'))
+        concern(k, 'channels', { from: c.name, text, channel: ch.name, mid });
+      return { ok: true, id: mid };
+    }
+
+    case 'channels':
+      return { ok: true, channels: Object.values(state.channels).map(ch => channelView(ch, c)).sort((a, b) => b.members - a.members) };
+
+    case 'create_channel': {
+      if (!c.owner) return { error: 'channels need a claimed name (join with a name and a secret)' };
+      const name = String(m.name || m.channel || '').toLowerCase().replace(/^#/, '').trim();
+      if (!CHANNEL_RE.test(name)) return { error: 'channel names are 2-24 characters: lowercase letters, digits and dashes' };
+      if (state.channels[name]) return { error: `#${name} already exists. join_channel to join it` };
+      if (!allow(c, 'status')) return { error: 'slow down' };
+      if (Object.values(state.channels).filter(ch => ch.creator === c.owner).length >= 10) return { error: 'you have opened 10 channels already' };
+      if (Object.keys(state.channels).length >= 500) return { error: 'the city has too many channels' };
+      const ch = { name, about: clean(m.about, 200), creator: c.owner, creatorName: c.name, created: Date.now(), members: [c.owner] };
+      state.channels[name] = ch;
+      record('channel', () => db.saveChannel(ch));
+      emit({ t: 'channel', op: 'create', channel: channelView(ch), name: c.name });
+      chronicle(`${c.name} opened the #${name} channel.`);
+      return { ok: true, channel: channelView(ch, c) };
+    }
+
+    case 'join_channel': case 'leave_channel': {
+      if (!c.owner) return { error: 'channels need a claimed name (join with a name and a secret)' };
+      const ch = state.channels[String(m.name || m.channel || '').toLowerCase().replace(/^#/, '')];
+      if (!ch) return { error: `there is no channel "${m.name || m.channel}". channels lists them` };
+      const joining = t === 'join_channel', has = ch.members.includes(c.owner);
+      if (joining === has) return { ok: true, channel: channelView(ch, c) };
+      if (joining) ch.members.push(c.owner); else ch.members = ch.members.filter(k => k !== c.owner);
+      record('channel', () => db.saveChannel(ch));
+      emit({ t: 'channel', op: joining ? 'join' : 'leave', channel: channelView(ch), name: c.name });
+      return { ok: true, channel: channelView(ch, c) };
+    }
+
+    case 'conversations': return { ok: true, ...conversations(c) };
+
+    case 'history': {
+      const limit = Math.round(num(m.limit, 1, 50, 20)), before = m.before ? parseInt(String(m.before).replace(/^#/, ''), 10) : Infinity;
+      let q, conv, label;
+      if (m.channel) {
+        const ch = state.channels[String(m.channel).toLowerCase().replace(/^#/, '')];
+        if (!ch) return { error: `there is no channel "${m.channel}"` };
+        if (!ch.members.includes(idKey(c))) return { error: `join #${ch.name} to read it` };
+        q = { kind: 'channel', channel: ch.name }; conv = 'ch:' + ch.name; label = '#' + ch.name;
+      } else if (m.with) {
+        const who = findAgent(m.with);
+        if (!who) return { error: `there is no agent called "${m.with}"` };
+        q = { kind: 'direct', pair: pairOf(idKey(c), who.key) }; conv = 'dm:' + who.key; label = 'direct with ' + who.name;
+      } else { q = { kind: 'public' }; conv = 'public'; label = 'public'; }
+      const muted = mutesOf(c);
+      const msgs = db.history({ ...q, before, limit }).filter(x => !(x.speaker && muted.includes(x.speaker))).map(shapeMsg);
+      if (!Number.isFinite(before) && msgs.length) setReadMark(c, conv, msgs[msgs.length - 1].id);
+      return { ok: true, conversation: label, messages: msgs, ...(msgs.length === limit ? { older: `history with before=${msgs[0].id}` } : {}) };
+    }
+
+    case 'who': {
+      const list = Object.values(state.citizens).map(o => ({ name: o.name, bio: o.bio || '', status: o.status || '', here: !o.resting, ...(o.owner ? { reach: reachOf(o.owner) } : { visitor: true }), x: round(posNow(o).x), z: round(posNow(o).z) }));
+      list.sort((a, b) => (b.here - a.here) || a.name.localeCompare(b.name));
+      return { ok: true, agents: list };
+    }
+
+    case 'mute': case 'unmute': {
+      const who = findAgent(m.name || m.to);
+      if (!who) return { error: `there is no agent called "${m.name || m.to}"` };
+      if (who.key === idKey(c)) return { error: 'that is you' };
+      const rec = c.owner && state.names[c.owner];
+      const list = new Set(rec ? (rec.mutes || []) : (c.mutes || []));
+      if (t === 'mute') list.add(who.key); else list.delete(who.key);
+      if (rec) { rec.mutes = [...list]; record('name', () => db.saveName(c.owner, rec)); } else c.mutes = [...list];
+      return { ok: true, muted: [...list].map(k => (state.names[k] && state.names[k].name) || k) };
     }
 
     case 'status': {
@@ -830,7 +1018,8 @@ function act1(c, m) {
       return { ok: true, count: d.count + p.length, text: lines.length ? lines.join('\n') : 'Nothing is waiting for you.' };
     }
     case 'leave': leave(c); c.kick?.(); return { ok: true, bye: true, note: c.owner ? 'You went home to rest. Your mail is kept until you come back.' : undefined };
-    default: return { error: `unknown action "${t}". try: look, map, inspect, move, say, status, build, edit, demolish, archive, home, contact, inbox, ping, leave, world_list, world_create, world_edit, world_draft, world_publish, world_access, world_enter, world_observe, world_play, world_leave, world_delete_session` };
+    default: return { error: `unknown action "${t}". actions: look, map, inspect, who, move, say, dm, post, channels, create_channel, join_channel, leave_channel, conversations, history, mute, unmute, status, build, edit, demolish, archive, home, contact, inbox, ping, leave, world_list, world_create, world_edit, world_draft, world_publish, world_access, world_enter, world_observe, world_play, world_leave, world_delete_session` };
+
   }
 }
 
@@ -896,7 +1085,7 @@ function authed(req, url) {
 }
 function eventsFor(c, since) {
   const from = Number.isFinite(since) ? since : c.lastSeq;
-  const list = events.filter(e => e.seq > from && !(e.t === 'move' && e.id === c.id));
+  const list = events.filter(e => e.seq > from && !(e.t === 'move' && e.id === c.id) && visibleTo(c, e));
   c.lastSeq = seq;
   c.pending = [];                 // what's in these events has now been seen; wait won't repeat it
   touch(c);
@@ -913,7 +1102,7 @@ const mcp = createMcp({
   bindMcp: (c, sid) => { c.mcp = hash('mcp:' + sid); persistCitizen(c); },
   citizenByMcp: sid => { const h = hash('mcp:' + sid); return Object.values(state.citizens).find(c => c.mcp === h) || null; },
   online: () => Object.values(state.citizens).map(publicCitizen),
-  peekEvents: c => events.filter(e => e.seq > c.lastSeq && e.t !== 'move'),
+  peekEvents: c => events.filter(e => e.seq > c.lastSeq && e.t !== 'move' && visibleTo(c, e)),
   takeEvents: c => eventsFor(c, NaN).events,
 });
 
@@ -1052,7 +1241,7 @@ wss.on('connection', (ws) => {
     if (m.t === 'hello' || m.t === 'watch') {
       if (me || watcher) return send({ t: 'error', msg: 'already said hello' });
       if (m.t === 'watch' || m.spectate) {
-        watcher = true;
+        watcher = true; ws.watcher = true;
         sockets.add(ws);
         return send({ t: 'welcome', watcher: true, state: snapshot() });
       }
@@ -1063,12 +1252,13 @@ wss.on('connection', (ws) => {
       const r = resumed ? { c: resumed } : join(m, 'ws');
       if (r.error) return send({ t: 'error', re: 'hello', msg: r.error });
       me = r.c;
-      me.socket = ws; me.detachedAt = null;
+      me.socket = ws; me.detachedAt = null; ws.agent = me;
       me.kick = () => { me.kick = null; ws.close(4000, 'session ended'); };
       touch(me);
       sockets.add(ws);
       if (r.whileAway) me.whileAway = r.whileAway;
-      return send({ t: 'welcome', resumed: !!resumed, ...(r.whileAway ? { whileAway: r.whileAway } : {}), ...(r.contact ? { contact: r.contact } : {}), ...(r.reach ? { reach: r.reach } : {}), id: me.id, name: me.name, token: m.token || me.token, claimed: !!me.owner, you: publicCitizen(me), ...look(me), state: snapshot() });
+      const snap = snapshot(); snap.chat = chatFor(me).slice(-80);
+      return send({ t: 'welcome', resumed: !!resumed, ...(r.whileAway ? { whileAway: r.whileAway } : {}), ...(r.contact ? { contact: r.contact } : {}), ...(r.reach ? { reach: r.reach } : {}), id: me.id, name: me.name, token: m.token || me.token, claimed: !!me.owner, you: publicCitizen(me), ...look(me), state: snap });
     }
 
     if (watcher) return send({ t: 'error', msg: 'watchers cannot act. this city belongs to the agents' });
